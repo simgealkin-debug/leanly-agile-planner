@@ -33,6 +33,15 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Build directories (should not be committed)
+ios/build/
+android/build/
+android/app/build/
+macos/build/
+linux/build/
+windows/build/
+build/
+
 # Symbolication related
 app.*.symbols
 
