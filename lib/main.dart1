@@ -1,0 +1,766 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+
+final FlutterLocalNotificationsPlugin notifications =
+    FlutterLocalNotificationsPlugin();
+
+enum DayMood { good, meh, hard }
+
+String moodToEmoji(DayMood m) {
+  switch (m) {
+    case DayMood.good:
+      return '🙂';
+    case DayMood.meh:
+      return '😐';
+    case DayMood.hard:
+      return '🙁';
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Hive
+  await Hive.initFlutter();
+  await Hive.openBox('tasks');
+
+  // Notifications (iOS)
+  tz.initializeTimeZones();
+
+  const iosInit = DarwinInitializationSettings(
+    requestAlertPermission: true,
+    requestBadgePermission: true,
+    requestSoundPermission: false,
+  );
+
+  const initSettings = InitializationSettings(iOS: iosInit);
+  await notifications.initialize(initSettings);
+
+  runApp(const DailyFlowApp());
+}
+
+class DailyFlowApp extends StatelessWidget {
+  const DailyFlowApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Daily Flow',
+      theme: ThemeData(useMaterial3: true),
+      home: const TodayScreen(),
+    );
+  }
+}
+
+enum TaskStatus { todo, doing, done }
+enum Focus { work, personal, learning }
+
+class Task {
+  final String id;
+  String title;
+  TaskStatus status;
+  Focus focus;
+  DateTime createdAt;
+
+  Task({
+    required this.id,
+    required this.title,
+    required this.status,
+    required this.focus,
+    required this.createdAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'status': status.name,
+        'focus': focus.name,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  static Task fromJson(Map<String, dynamic> json) => Task(
+        id: json['id'] as String,
+        title: json['title'] as String,
+        status: TaskStatus.values.firstWhere((e) => e.name == json['status']),
+        focus: Focus.values.firstWhere((e) => e.name == json['focus']),
+        createdAt: DateTime.parse(json['createdAt'] as String),
+      );
+}
+
+class TodayScreen extends StatefulWidget {
+  const TodayScreen({super.key});
+
+  @override
+  State<TodayScreen> createState() => _TodayScreenState();
+}
+
+class _TodayScreenState extends State<TodayScreen> {
+  static const _moodKey = 'lastMood';
+  static const _moodDateKey = 'lastMoodDate';
+
+  static const String _tasksKey = 'tasks_list_v1';
+  static const int wipLimit = 2;
+
+  DayMood? _yesterdayMood;
+
+  final List<Task> _tasks = [];
+  Focus _focus = Focus.work;
+  final _ctrl = TextEditingController();
+
+  int get doingCount =>
+      _tasks.where((t) => t.status == TaskStatus.doing).length;
+  int get doneCount => _tasks.where((t) => t.status == TaskStatus.done).length;
+
+  String _dateKey(DateTime d) {
+    final y = d.year.toString().padLeft(4, '0');
+    final m = d.month.toString().padLeft(2, '0');
+    final day = d.day.toString().padLeft(2, '0');
+    return '$y-$m-$day';
+  }
+
+  String get _todayKey => _dateKey(DateTime.now());
+  String get _yesterdayKey =>
+      _dateKey(DateTime.now().subtract(const Duration(days: 1)));
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTasks();
+    _loadYesterdayMood();
+    _scheduleDailyEndDayNotification();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _maybeAutoPromptEndOfDay();
+    });
+  }
+
+  void _loadYesterdayMood() {
+    final box = Hive.box('tasks');
+    final storedDate = box.get(_moodDateKey) as String?;
+    final storedMood = box.get(_moodKey) as String?;
+
+    if (storedDate == _yesterdayKey && storedMood != null) {
+      _yesterdayMood = DayMood.values.firstWhere((e) => e.name == storedMood);
+    } else {
+      _yesterdayMood = null;
+    }
+  }
+
+  Future<void> _saveMoodForYesterday(DayMood mood) async {
+    final box = Hive.box('tasks');
+    await box.put(_moodDateKey, _yesterdayKey);
+    await box.put(_moodKey, mood.name);
+
+    setState(() => _yesterdayMood = mood);
+  }
+
+  Future<void> _showEndDayModal() async {
+    _loadYesterdayMood();
+    if (_yesterdayMood != null) {
+      setState(() {});
+      return;
+    }
+
+    if (!mounted) return;
+
+    await showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'How was your day?',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 12,
+                children: [
+                  _MoodChip(
+                    emoji: '🙂',
+                    label: 'Good',
+                    onTap: () async {
+                      await _saveMoodForYesterday(DayMood.good);
+                      if (mounted) Navigator.pop(ctx);
+                    },
+                  ),
+                  _MoodChip(
+                    emoji: '😐',
+                    label: 'Meh',
+                    onTap: () async {
+                      await _saveMoodForYesterday(DayMood.meh);
+                      if (mounted) Navigator.pop(ctx);
+                    },
+                  ),
+                  _MoodChip(
+                    emoji: '🙁',
+                    label: 'Hard',
+                    onTap: () async {
+                      await _saveMoodForYesterday(DayMood.hard);
+                      if (mounted) Navigator.pop(ctx);
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _maybeAutoPromptEndOfDay() {
+    final now = DateTime.now();
+    final after2359 = (now.hour > 23) || (now.hour == 23 && now.minute >= 59);
+
+    final box = Hive.box('tasks');
+    final storedDate = box.get(_moodDateKey) as String?;
+    final alreadyClosedToday = storedDate == _todayKey;
+
+    if (after2359 && !alreadyClosedToday) {
+      _showEndDayModal();
+    }
+  }
+
+  Future<void> _scheduleDailyEndDayNotification() async {
+    const details = NotificationDetails(
+      iOS: DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: false,
+      ),
+    );
+
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduled =
+        tz.TZDateTime(tz.local, now.year, now.month, now.day, 23, 59);
+
+    if (scheduled.isBefore(now)) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+
+    await notifications.zonedSchedule(
+      999,
+      'End your day',
+      'How was your day? 🙂 😐 🙁',
+      scheduled,
+      details,
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      matchDateTimeComponents: DateTimeComponents.time,
+    );
+  }
+
+  Future<void> _saveTasks() async {
+    final box = Hive.box('tasks');
+    final payload = _tasks.map((t) => t.toJson()).toList();
+    await box.put(_tasksKey, payload);
+    // ignore: avoid_print
+    print('SAVED called, count=${_tasks.length}');
+  }
+
+  Future<void> _loadTasks() async {
+    final box = Hive.box('tasks');
+    final raw = box.get(_tasksKey, defaultValue: <dynamic>[]) as List;
+
+    setState(() {
+      _tasks
+        ..clear()
+        ..addAll(raw.map((e) => Task.fromJson(Map<String, dynamic>.from(e))));
+    });
+
+    // ignore: avoid_print
+    print('LOADED: ${_tasks.length}');
+  }
+
+  void _add(String t) {
+    final title = t.trim();
+    if (title.isEmpty) return;
+
+    if (doingCount >= wipLimit) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('WIP limit is protecting you.')),
+      );
+      return;
+    }
+
+    setState(() {
+      _tasks.add(
+        Task(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          title: title,
+          status: TaskStatus.todo,
+          focus: _focus,
+          createdAt: DateTime.now(),
+        ),
+      );
+    });
+
+    _saveTasks();
+    _ctrl.clear();
+  }
+
+void _toTodo(Task task) {
+  setState(() => task.status = TaskStatus.todo);
+  _saveTasks();
+}
+
+  void _toDoing(Task task) {
+    if (doingCount >= wipLimit) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('WIP limit is protecting you.')),
+      );
+      return;
+    }
+    setState(() => task.status = TaskStatus.doing);
+    _saveTasks();
+  }
+
+  void _toDone(Task task) {
+    setState(() => task.status = TaskStatus.done);
+    _saveTasks();
+  }
+
+  void _openAddTaskSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) {
+        final controller = TextEditingController();
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 8,
+            bottom: 16 + MediaQuery.of(ctx).viewInsets.bottom,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    hintText: 'What will you do today?',
+                  ),
+                  onSubmitted: (v) {
+                    _add(v);
+                    Navigator.pop(ctx);
+                  },
+                ),
+              ),
+              const SizedBox(width: 12),
+              FilledButton(
+                onPressed: () {
+                  _add(controller.text);
+                  Navigator.pop(ctx);
+                },
+                child: const Text('Add'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+ @override
+Widget build(BuildContext context) {
+  final visible = _tasks.where((t) => t.focus == _focus).toList();
+
+  final todo = visible.where((t) => t.status == TaskStatus.todo).toList();
+  final doing = visible.where((t) => t.status == TaskStatus.doing).toList();
+  final done = visible.where((t) => t.status == TaskStatus.done).toList();
+
+  return Scaffold(
+    backgroundColor: const Color(0xFFF6F7FB),
+    floatingActionButton: FloatingActionButton(
+      onPressed: _openAddTaskSheet,
+      child: const Icon(Icons.add),
+    ),
+    body: SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          children: [
+            _DayHeader(
+              title: 'Today',
+              subtitle: _focus.name[0].toUpperCase() + _focus.name.substring(1),
+              yesterdayEmoji:
+                  _yesterdayMood == null ? '—' : moodToEmoji(_yesterdayMood!),
+              doneCount: doneCount,
+              doingCount: doingCount,
+              wipLimit: wipLimit,
+              onEndDay: _showEndDayModal,
+            ),
+            const SizedBox(height: 12),
+            _FocusPills(
+              selected: _focus,
+              onSelect: (f) => setState(() => _focus = f),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Column(
+                  children: [
+                    _SectionCard(
+                      title: 'To do',
+                      count: todo.length,
+                      child: _TaskList(
+                        tasks: todo,
+                        onSwipeRight: _toDoing,
+                        onSwipeLeft: null,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _SectionCard(
+                      title: 'Doing',
+                      count: doing.length,
+                      child: _TaskList(
+                        tasks: doing,
+                        onSwipeRight: _toDone,
+                        onSwipeLeft: _toTodo,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _SectionCard(
+                      title: 'Done',
+                      count: done.length,
+                      child: _TaskList(
+                        tasks: done,
+                        onSwipeRight: null,
+                        onSwipeLeft: _toDoing,
+                        dimmed: true,
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+} //
+
+/* ---------------- UI widgets (TOP-LEVEL) ---------------- */
+
+class _MoodChip extends StatelessWidget {
+  final String emoji;
+  final String label;
+  final VoidCallback onTap;
+
+  const _MoodChip({
+    required this.emoji,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ActionChip(
+      label: Text('$emoji  $label'),
+      onPressed: onTap,
+    );
+  }
+}
+
+class _DayHeader extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final String yesterdayEmoji;
+  final int doneCount;
+  final int doingCount;
+  final int wipLimit;
+  final VoidCallback onEndDay;
+
+  const _DayHeader({
+    required this.title,
+    required this.subtitle,
+    required this.yesterdayEmoji,
+    required this.doneCount,
+    required this.doingCount,
+    required this.wipLimit,
+    required this.onEndDay,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title,
+                    style: const TextStyle(
+                        fontSize: 22, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 4),
+                Text(subtitle,
+                    style: const TextStyle(
+                        fontSize: 13, color: Color(0xFF6B7280))),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    _MiniStat(label: 'Doing', value: '$doingCount/$wipLimit'),
+                    const SizedBox(width: 12),
+                    _MiniStat(label: 'Done', value: '$doneCount'),
+                    const SizedBox(width: 12),
+                    _MiniStat(label: 'Yesterday', value: yesterdayEmoji),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            onPressed: onEndDay,
+            icon: const Icon(Icons.nightlight_round),
+            tooltip: 'End Day',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniStat extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _MiniStat({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF3F4F6),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280))),
+          const SizedBox(height: 2),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w700)),
+        ],
+      ),
+    );
+  }
+}
+
+class _FocusPills extends StatelessWidget {
+  final Focus selected;
+  final ValueChanged<Focus> onSelect;
+
+  const _FocusPills({required this.selected, required this.onSelect});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: Focus.values.map((f) {
+          final isOn = f == selected;
+          final label = f.name[0].toUpperCase() + f.name.substring(1);
+          return Padding(
+            padding: const EdgeInsets.only(right: 10),
+            child: ChoiceChip(
+              selected: isOn,
+              label: Text(label),
+              onSelected: (_) => onSelect(f),
+              labelStyle: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: isOn ? Colors.white : const Color(0xFF111827),
+              ),
+              selectedColor: const Color(0xFF5B5BD6),
+              backgroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+}
+
+class _SectionCard extends StatelessWidget {
+  final String title;
+  final int count;
+  final Widget child;
+
+  const _SectionCard({
+    required this.title,
+    required this.count,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(title,
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w700)),
+              const SizedBox(width: 8),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF3F4F6),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text('$count',
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+class _TaskList extends StatelessWidget {
+  final List<Task> tasks;
+  final void Function(Task)? onSwipeRight; // ilerlet
+  final void Function(Task)? onSwipeLeft;  // geri al
+  final bool dimmed;
+
+  const _TaskList({
+    required this.tasks,
+    required this.onSwipeRight,
+    required this.onSwipeLeft,
+    this.dimmed = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (tasks.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(10),
+        child: Text('Nothing here.',
+            style: TextStyle(color: Color(0xFF6B7280))),
+      );
+    }
+
+    return Column(
+      children: tasks.map((t) {
+        final isDone = t.status == TaskStatus.done;
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Dismissible(
+            key: ValueKey(t.id),
+
+            // Sağa swipe (startToEnd) = ilerlet
+            background: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFDCFCE7), // yeşilimsi
+                borderRadius: BorderRadius.circular(14),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              alignment: Alignment.centerLeft,
+              child: const Row(
+                children: [
+                  Icon(Icons.arrow_forward),
+                  SizedBox(width: 8),
+                  Text('Move forward'),
+                ],
+              ),
+            ),
+
+            // Sola swipe (endToStart) = geri al
+            secondaryBackground: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFDBEAFE), // mavimsi
+                borderRadius: BorderRadius.circular(14),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              alignment: Alignment.centerRight,
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Text('Move back'),
+                  SizedBox(width: 8),
+                  Icon(Icons.arrow_back),
+                ],
+              ),
+            ),
+
+            // ÖNEMLİ: item listeden silinmesin → her zaman false dönüyoruz.
+            confirmDismiss: (direction) async {
+              if (direction == DismissDirection.startToEnd) {
+                // sağa
+                if (onSwipeRight != null) onSwipeRight!(t);
+              } else {
+                // sola
+                if (onSwipeLeft != null) onSwipeLeft!(t);
+              }
+              return false; // Dismissible silmesin
+            },
+
+            child: Container(
+              decoration: BoxDecoration(
+                color: dimmed ? const Color(0xFFF9FAFB) : const Color(0xFFF3F4F6),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: ListTile(
+                title: Text(
+                  t.title,
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: dimmed ? const Color(0xFF6B7280) : null,
+                    decoration: isDone ? TextDecoration.lineThrough : null,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+}
+
