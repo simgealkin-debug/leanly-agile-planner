@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -10,6 +11,10 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:flutter/foundation.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:provider/provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'config/supabase_config.dart';
+import 'services/supabase_service.dart';
+import 'services/auth_service.dart';
 
 
 
@@ -24,6 +29,17 @@ Future<void> main() async {
   // Initialize Hive
   await Hive.initFlutter();
   await Hive.openBox(Storage.boxName);
+
+  // Initialize Supabase
+  try {
+    await Supabase.initialize(
+      url: SupabaseConfig.supabaseUrl,
+      anonKey: SupabaseConfig.supabaseAnonKey,
+    );
+    debugPrint('Supabase initialized successfully');
+  } catch (e) {
+    debugPrint('Failed to initialize Supabase: $e');
+  }
 
   // Initialize timezone
   tz.initializeTimeZones();
@@ -53,18 +69,32 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   bool _darkMode = Storage.loadDarkMode();
+  AppTheme _theme = Storage.loadTheme();
   late final PremiumController _premiumController;
 
   @override
   void initState() {
     super.initState();
     _premiumController = PremiumController();
+    // Listen to premium changes to update theme if needed
+    _premiumController.addListener(_onPremiumChanged);
   }
 
   @override
   void dispose() {
+    _premiumController.removeListener(_onPremiumChanged);
     _premiumController.dispose();
     super.dispose();
+  }
+
+  void _onPremiumChanged() {
+    // If user loses premium, reset to default theme
+    if (!_premiumController.isPremium && _theme != AppTheme.calm) {
+      setState(() {
+        _theme = AppTheme.calm;
+      });
+      Storage.saveTheme(AppTheme.calm);
+    }
   }
 
   void toggleDarkMode(bool value) {
@@ -74,6 +104,13 @@ class _MyAppState extends State<MyApp> {
     Storage.saveDarkMode(value);
   }
 
+  void setTheme(AppTheme theme) {
+    setState(() {
+      _theme = theme;
+    });
+    Storage.saveTheme(theme);
+  }
+
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider.value(
@@ -81,11 +118,18 @@ class _MyAppState extends State<MyApp> {
       child: MaterialApp(
         title: 'Leanly: Agile Planner',
         debugShowCheckedModeBanner: false,
-        theme: buildCalmTheme(),
-        darkTheme: buildCalmDarkTheme(),
+        locale: const Locale('en', 'GB'), // Pazartesi ilk gün (Mon–Fri)
+        localizationsDelegates: GlobalMaterialLocalizations.delegates,
+        supportedLocales: const [
+          Locale('en', 'GB'),
+          Locale('en', 'US'),
+        ],
+        theme: buildTheme(_theme, false),
+        darkTheme: buildTheme(_theme, true),
         themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
         home: AppShell(
           onDarkModeChanged: toggleDarkMode,
+          onThemeChanged: setTheme,
         ),
       ),
     );
@@ -97,7 +141,8 @@ class _MyAppState extends State<MyApp> {
 enum TaskStatus { todo, doing, done }
 enum Focus { work, personal, learning }
 enum DayMood { good, meh, hard }
-enum FlowMode { scrum, kanban, xp }
+enum FlowMode { scrum, kanban }
+enum AppTheme { calm, ocean, forest, sunset, darkProfessional }
 
 String moodToEmoji(DayMood m) {
   switch (m) {
@@ -129,6 +174,10 @@ class Task {
   // Scrum daily commitment
   bool committedToday;
 
+  // New features
+  List<String> tags; // Task tags/labels
+  DateTime? dueDate; // Task due date
+
   Task({
     required this.id,
     required this.title,
@@ -139,6 +188,8 @@ class Task {
     this.rolledOver = false,
     this.carriedOverFromDay,
     this.committedToday = false,
+    this.tags = const [],
+    this.dueDate,
   });
 
   Task copyWith({
@@ -149,6 +200,8 @@ class Task {
     bool? rolledOver,
     String? carriedOverFromDay,
     bool? committedToday,
+    List<String>? tags,
+    DateTime? dueDate,
   }) {
     return Task(
       id: id,
@@ -160,6 +213,8 @@ class Task {
       rolledOver: rolledOver ?? this.rolledOver,
       carriedOverFromDay: carriedOverFromDay ?? this.carriedOverFromDay,
       committedToday: committedToday ?? this.committedToday,
+      tags: tags ?? this.tags,
+      dueDate: dueDate ?? this.dueDate,
     );
   }
 
@@ -173,22 +228,119 @@ class Task {
         'rolledOver': rolledOver,
         'carriedOverFromDay': carriedOverFromDay,
         'committedToday': committedToday,
+        'tags': tags,
+        'dueDate': dueDate?.toIso8601String(),
       };
 
-  static Task fromJson(Map<String, dynamic> json) => Task(
+  static Task fromJson(Map<String, dynamic> json) {
+    final tagsRaw = json['tags'];
+    final tags = tagsRaw is List ? tagsRaw.map((e) => e.toString()).toList() : <String>[];
+    
+    final dueDateRaw = json['dueDate'];
+    final dueDate = dueDateRaw != null ? DateTime.parse(dueDateRaw as String) : null;
+    
+    return Task(
+      id: json['id'] as String,
+      title: json['title'] as String,
+      status: TaskStatus.values
+          .firstWhere((e) => e.name == (json['status'] as String)),
+      focus:
+          Focus.values.firstWhere((e) => e.name == (json['focus'] as String)),
+      createdAt: DateTime.parse(json['createdAt'] as String),
+      updatedAt: DateTime.parse(
+          (json['updatedAt'] as String?) ?? (json['createdAt'] as String)),
+      rolledOver: (json['rolledOver'] as bool?) ?? false,
+      carriedOverFromDay: json['carriedOverFromDay'] as String?,
+      committedToday: (json['committedToday'] as bool?) ?? false,
+      tags: tags,
+      dueDate: dueDate,
+    );
+  }
+}
+
+/* ===================== Sprint ===================== */
+
+class Sprint {
+  final String id;
+  final String name;
+  final DateTime startDate;
+  final DateTime endDate;
+  final List<String> taskIds; // Core 5
+  final List<String> stretchTaskIds; // Stretch (core 5 sonrası, completion %'e dahil değil)
+
+  Sprint({
+    required this.id,
+    required this.name,
+    required this.startDate,
+    required this.endDate,
+    required this.taskIds,
+    List<String>? stretchTaskIds,
+  }) : stretchTaskIds = stretchTaskIds ?? [];
+
+  /// Completion yüzdesi sadece core 5 üzerinden
+  double completionPercentage(List<Task> allTasks) {
+    if (taskIds.isEmpty) return 0.0;
+    final sprintTasks = allTasks.where((t) => taskIds.contains(t.id)).toList();
+    if (sprintTasks.isEmpty) return 0.0;
+    final completed = sprintTasks.where((t) => t.status == TaskStatus.done).length;
+    return (completed / sprintTasks.length) * 100;
+  }
+
+  /// Tamamlanan task sayısı
+  int completedCount(List<Task> allTasks) {
+    final sprintTasks = allTasks.where((t) => taskIds.contains(t.id)).toList();
+    return sprintTasks.where((t) => t.status == TaskStatus.done).length;
+  }
+
+  /// Toplam task sayısı
+  int totalCount() => taskIds.length;
+
+  /// Sprint aktif mi? (bugün startDate ve endDate arasında mı?)
+  bool isActive() {
+    final now = DateTime.now();
+    return now.isAfter(startDate) && now.isBefore(endDate);
+  }
+
+  /// Sprint geçmiş mi?
+  bool isPast() => DateTime.now().isAfter(endDate);
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'startDate': startDate.toIso8601String(),
+        'endDate': endDate.toIso8601String(),
+        'taskIds': taskIds,
+        'stretchTaskIds': stretchTaskIds,
+      };
+
+  static Sprint fromJson(Map<String, dynamic> json) => Sprint(
         id: json['id'] as String,
-        title: json['title'] as String,
-        status: TaskStatus.values
-            .firstWhere((e) => e.name == (json['status'] as String)),
-        focus:
-            Focus.values.firstWhere((e) => e.name == (json['focus'] as String)),
-        createdAt: DateTime.parse(json['createdAt'] as String),
-        updatedAt: DateTime.parse(
-            (json['updatedAt'] as String?) ?? (json['createdAt'] as String)),
-        rolledOver: (json['rolledOver'] as bool?) ?? false,
-        carriedOverFromDay: json['carriedOverFromDay'] as String?,
-        committedToday: (json['committedToday'] as bool?) ?? false,
+        name: json['name'] as String,
+        startDate: DateTime.parse(json['startDate'] as String),
+        endDate: DateTime.parse(json['endDate'] as String),
+        taskIds: (json['taskIds'] as List).map((e) => e.toString()).toList(),
+        stretchTaskIds: (json['stretchTaskIds'] as List?)?.map((e) => e.toString()).toList(),
       );
+
+  /// Yeni sprint oluştur (bu hafta için - Pazartesi–Cuma)
+  static Sprint createForThisWeek() {
+    final now = DateTime.now();
+    final startOfWeek = DateTime(now.year, now.month, now.day - (now.weekday - 1));
+    final endOfWeek = startOfWeek.add(const Duration(days: 6)); // Mon–Fri, exclusive end Sat 00:00
+    
+    // "Week of Feb 22" formatında isim
+    final monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final name = 'Week of ${monthNames[startOfWeek.month - 1]} ${startOfWeek.day}';
+    
+    return Sprint(
+      id: 'sprint_${startOfWeek.toIso8601String()}',
+      name: name,
+      startDate: startOfWeek,
+      endDate: endOfWeek,
+      taskIds: [],
+      stretchTaskIds: [],
+    );
+  }
 }
 
 class DayLog {
@@ -289,6 +441,9 @@ class Storage {
 
   static String dayLogKey(String dayKey) => 'daylog_$dayKey';
   static String pomodoroKey(String dayKey) => 'pomodoro_$dayKey';
+  static const activeSprintKey = 'active_sprint_v1';
+  static const sprintHistoryKey = 'sprint_history_v1';
+  static const pomodoroSettingsKey = 'pomodoro_settings_v1';
 
   static Box get box => Hive.box(boxName);
 
@@ -299,8 +454,47 @@ class Storage {
         .toList();
   }
 
+  /// Save tasks to both local cache and remote (if authenticated)
   static Future<void> saveActiveTasks(List<Task> tasks) async {
+    // Always save to local cache first (for offline support)
     await box.put(activeTasksKey, tasks.map((t) => t.toJson()).toList());
+    
+    // Sync to remote if authenticated
+    if (SupabaseService.isAuthenticated) {
+      try {
+        await SupabaseService.syncTasksToRemote(tasks);
+      } catch (e) {
+        debugPrint('Failed to sync tasks to remote: $e');
+        // Continue without remote sync (local cache is saved)
+      }
+    }
+  }
+  
+  /// Sync tasks from remote to local (or push local to remote if remote is empty)
+  static Future<List<Task>> syncTasksFromRemote() async {
+    if (!SupabaseService.isAuthenticated) {
+      return loadActiveTasks(); // Return local if not authenticated
+    }
+    
+    try {
+      final remoteTasks = await SupabaseService.fetchTasks();
+      final localTasks = loadActiveTasks();
+      
+      if (remoteTasks.isNotEmpty) {
+        // Remote has tasks - use remote (remote wins)
+        await box.put(activeTasksKey, remoteTasks.map((t) => t.toJson()).toList());
+        return remoteTasks;
+      } else if (localTasks.isNotEmpty) {
+        // Remote is empty but local has tasks - push local to remote
+        await SupabaseService.saveTasks(localTasks);
+        return localTasks;
+      }
+    } catch (e) {
+      debugPrint('Failed to sync tasks from remote: $e');
+    }
+    
+    // Fallback to local cache
+    return loadActiveTasks();
   }
 
   static FlowMode loadMode() {
@@ -310,11 +504,11 @@ class Storage {
       if (m != null) {
         return FlowMode.values.firstWhere(
           (e) => e.name == m,
-          orElse: () => FlowMode.kanban,
+          orElse: () => FlowMode.scrum,
         );
       }
     }
-    return FlowMode.kanban;
+    return FlowMode.scrum;
   }
 
   static Future<void> saveMode(FlowMode mode) async {
@@ -349,11 +543,71 @@ class Storage {
     return false;
   }
 
+  /// Save premium status to both local cache and remote (if authenticated)
   static Future<void> savePremiumStatus(bool isPremium) async {
+    // Always save to local cache first
     final existing = box.get(settingsKey);
     final map = <String, dynamic>{};
     if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
     map['isPremium'] = isPremium;
+    await box.put(settingsKey, map);
+    
+    // Sync to remote if authenticated
+    if (SupabaseService.isAuthenticated) {
+      try {
+        await SupabaseService.setPremiumStatus(
+          isPremium: isPremium,
+          platform: 'ios',
+        );
+      } catch (e) {
+        debugPrint('Failed to sync premium status to remote: $e');
+        // Continue without remote sync (local cache is saved)
+      }
+    }
+  }
+  
+  /// Sync premium status from remote
+  static Future<bool> syncPremiumStatusFromRemote() async {
+    if (!SupabaseService.isAuthenticated) {
+      return loadPremiumStatus(); // Return local if not authenticated
+    }
+    
+    try {
+      final remotePremium = await SupabaseService.fetchPremiumStatus();
+      // Save to local cache
+      final existing = box.get(settingsKey);
+      final map = <String, dynamic>{};
+      if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
+      map['isPremium'] = remotePremium;
+      await box.put(settingsKey, map);
+      return remotePremium;
+    } catch (e) {
+      debugPrint('Failed to sync premium status from remote: $e');
+    }
+    
+    // Fallback to local cache
+    return loadPremiumStatus();
+  }
+
+  static AppTheme loadTheme() {
+    final raw = box.get(settingsKey);
+    if (raw is Map) {
+      final t = raw['theme'] as String?;
+      if (t != null) {
+        return AppTheme.values.firstWhere(
+          (e) => e.name == t,
+          orElse: () => AppTheme.calm,
+        );
+      }
+    }
+    return AppTheme.calm;
+  }
+
+  static Future<void> saveTheme(AppTheme theme) async {
+    final existing = box.get(settingsKey);
+    final map = <String, dynamic>{};
+    if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
+    map['theme'] = theme.name;
     await box.put(settingsKey, map);
   }
 
@@ -373,8 +627,20 @@ class Storage {
     await box.put(settingsKey, map);
   }
 
+  /// Save day log to both local cache and remote (if authenticated)
   static Future<void> saveDayLog(DayLog log) async {
+    // Always save to local cache first
     await box.put(dayLogKey(log.dayKey), log.toJson());
+    
+    // Sync to remote if authenticated
+    if (SupabaseService.isAuthenticated) {
+      try {
+        await SupabaseService.saveDayLog(log);
+      } catch (e) {
+        debugPrint('Failed to sync day log to remote: $e');
+        // Continue without remote sync (local cache is saved)
+      }
+    }
   }
 
   static DayLog? loadDayLog(String dayKey) {
@@ -414,6 +680,150 @@ class Storage {
     list.add(s.toJson());
     await box.put(key, list);
   }
+
+  // ===================== Pomodoro Settings =====================
+
+  /// Load pomodoro settings
+  static Map<String, dynamic> loadPomodoroSettings() {
+    final raw = box.get(pomodoroSettingsKey);
+    if (raw is Map) {
+      return Map<String, dynamic>.from(raw);
+    }
+    // Default settings
+    return {
+      'workMinutes': PomodoroController.defaultWorkMinutes,
+      'breakMinutes': PomodoroController.defaultBreakMinutes,
+    };
+  }
+
+  /// Save pomodoro settings
+  static Future<void> savePomodoroSettings(Map<String, dynamic> settings) async {
+    await box.put(pomodoroSettingsKey, settings);
+  }
+
+  // ===================== Sprint =====================
+
+  /// Aktif sprint'i yükle (bu hafta için) - Otomatik başlat
+  static Sprint loadActiveSprint() {
+    final raw = box.get(activeSprintKey);
+    Sprint? sprint;
+    
+    if (raw is Map) {
+      sprint = Sprint.fromJson(Map<String, dynamic>.from(raw));
+    }
+    
+    // Sprint yoksa veya geçmişse, otomatik olarak yeni sprint başlat
+    if (sprint == null || sprint.isPast()) {
+      final newSprint = Sprint.createForThisWeek();
+      // Async olmadan kaydet (sync operation)
+      box.put(activeSprintKey, newSprint.toJson());
+      return newSprint;
+    }
+    
+    return sprint;
+  }
+
+  /// Aktif sprint'i kaydet
+  static Future<void> saveActiveSprint(Sprint sprint) async {
+    await box.put(activeSprintKey, sprint.toJson());
+  }
+
+  /// Sprint'e core task ekle
+  static Future<void> addTaskToSprint(String taskId) async {
+    final sprint = loadActiveSprint();
+    if (!sprint.taskIds.contains(taskId)) {
+      final updatedSprint = Sprint(
+        id: sprint.id,
+        name: sprint.name,
+        startDate: sprint.startDate,
+        endDate: sprint.endDate,
+        taskIds: [...sprint.taskIds, taskId],
+        stretchTaskIds: sprint.stretchTaskIds,
+      );
+      await saveActiveSprint(updatedSprint);
+    }
+  }
+
+  /// Backlog'dan (stretch) Sprint Commitments'a taşı (core)
+  static Future<bool> moveTaskFromStretchToCore(String taskId) async {
+    final sprint = loadActiveSprint();
+    if (sprint.taskIds.length >= 5) return false;
+    if (!sprint.stretchTaskIds.contains(taskId)) return false;
+    final updatedSprint = Sprint(
+      id: sprint.id,
+      name: sprint.name,
+      startDate: sprint.startDate,
+      endDate: sprint.endDate,
+      taskIds: [...sprint.taskIds, taskId],
+      stretchTaskIds: sprint.stretchTaskIds.where((id) => id != taskId).toList(),
+    );
+    await saveActiveSprint(updatedSprint);
+    return true;
+  }
+
+  /// Sprint'e stretch task ekle (core 5 tamamlandıktan sonra)
+  static Future<void> addTaskToStretch(String taskId) async {
+    final sprint = loadActiveSprint();
+    if (!sprint.stretchTaskIds.contains(taskId)) {
+      final updatedSprint = Sprint(
+        id: sprint.id,
+        name: sprint.name,
+        startDate: sprint.startDate,
+        endDate: sprint.endDate,
+        taskIds: sprint.taskIds,
+        stretchTaskIds: [...sprint.stretchTaskIds, taskId],
+      );
+      await saveActiveSprint(updatedSprint);
+    }
+  }
+
+  /// Sprint'ten task kaldır (core veya stretch)
+  static Future<void> removeTaskFromSprint(String taskId) async {
+    final sprint = loadActiveSprint();
+    final updatedSprint = Sprint(
+      id: sprint.id,
+      name: sprint.name,
+      startDate: sprint.startDate,
+      endDate: sprint.endDate,
+      taskIds: sprint.taskIds.where((id) => id != taskId).toList(),
+      stretchTaskIds: sprint.stretchTaskIds.where((id) => id != taskId).toList(),
+    );
+    await saveActiveSprint(updatedSprint);
+  }
+
+  /// Sprint'teki mevcut olmayan (silinmiş) task ID'lerini temizle
+  static Future<void> cleanOrphanedSprintTaskIds(List<Task> currentTasks) async {
+    final sprint = loadActiveSprint();
+    final validIds = currentTasks.map((t) => t.id).toSet();
+    final cleanedCore = sprint.taskIds.where((id) => validIds.contains(id)).toList();
+    final cleanedStretch = sprint.stretchTaskIds.where((id) => validIds.contains(id)).toList();
+    if (cleanedCore.length != sprint.taskIds.length || cleanedStretch.length != sprint.stretchTaskIds.length) {
+      final updatedSprint = Sprint(
+        id: sprint.id,
+        name: sprint.name,
+        startDate: sprint.startDate,
+        endDate: sprint.endDate,
+        taskIds: cleanedCore,
+        stretchTaskIds: cleanedStretch,
+      );
+      await saveActiveSprint(updatedSprint);
+    }
+  }
+
+  /// Sprint geçmişini yükle (premium için)
+  static List<Sprint> loadSprintHistory() {
+    final raw = box.get(sprintHistoryKey, defaultValue: <dynamic>[]) as List;
+    return raw
+        .map((e) => Sprint.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Sprint'i geçmişe ekle (sprint bittiğinde)
+  static Future<void> archiveSprint(Sprint sprint) async {
+    final history = loadSprintHistory();
+    history.add(sprint);
+    await box.put(sprintHistoryKey, history.map((s) => s.toJson()).toList());
+  }
 }
 
 /* ===================== Premium ===================== */
@@ -425,15 +835,30 @@ class PremiumController extends ChangeNotifier {
   bool _isPremium = false;
   final InAppPurchase _inAppPurchase = InAppPurchase.instance;
   StreamSubscription<List<PurchaseDetails>>? _subscription;
+  String? _lastPurchaseError;
 
   bool get isPremium => _isPremium;
+  String? get lastPurchaseError => _lastPurchaseError;
 
   PremiumController() {
     _loadPremiumStatus();
     _initializePurchaseListener();
   }
 
-  void _loadPremiumStatus() {
+  Future<void> _loadPremiumStatus() async {
+    // Try to load from remote first if authenticated
+    if (SupabaseService.isAuthenticated) {
+      try {
+        _isPremium = await Storage.syncPremiumStatusFromRemote();
+        notifyListeners();
+        return;
+      } catch (e) {
+        debugPrint('Failed to load premium from remote: $e');
+        // Fallback to local
+      }
+    }
+    
+    // Fallback to local cache
     _isPremium = Storage.loadPremiumStatus();
     notifyListeners();
   }
@@ -442,7 +867,11 @@ class PremiumController extends ChangeNotifier {
     _subscription = _inAppPurchase.purchaseStream.listen(
       _onPurchaseUpdate,
       onDone: () => _subscription?.cancel(),
-      onError: (error) => debugPrint('Purchase stream error: $error'),
+      onError: (error) {
+        debugPrint('Purchase stream error: $error');
+        _lastPurchaseError = 'Connection error. Please check your internet connection.';
+        notifyListeners();
+      },
     );
   }
 
@@ -451,27 +880,116 @@ class PremiumController extends ChangeNotifier {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         if (purchase.productID == _kPremiumProductId) {
+          _lastPurchaseError = null; // Clear error on success
           await _setPremiumStatus(true);
+          
+          // Sync premium status to backend if authenticated
+          if (SupabaseService.isAuthenticated) {
+            try {
+              await SupabaseService.setPremiumStatus(
+                isPremium: true,
+                platform: 'ios',
+              );
+            } catch (e) {
+              debugPrint('Failed to sync premium to backend: $e');
+              // Continue anyway (local is saved)
+            }
+          }
+          
           if (purchase.pendingCompletePurchase) {
             await _inAppPurchase.completePurchase(purchase);
           }
+          notifyListeners();
         }
       } else if (purchase.status == PurchaseStatus.error) {
-        debugPrint('Purchase error: ${purchase.error}');
+        final error = purchase.error;
+        debugPrint('Purchase error: $error');
+        if (error != null) {
+          _lastPurchaseError = _getErrorMessage(error);
+        } else {
+          _lastPurchaseError = 'Purchase failed. Please try again.';
+        }
+        notifyListeners();
+      } else if (purchase.status == PurchaseStatus.pending) {
+        debugPrint('Purchase pending: ${purchase.productID}');
       }
+    }
+  }
+
+  String _getErrorMessage(IAPError error) {
+    final code = error.code;
+    final message = error.message ?? 'Unknown error';
+    
+    // Map common error codes to user-friendly messages
+    switch (code) {
+      case 'storekit_unknown':
+        return 'Purchase failed. Please try again later.';
+      case 'storekit_product_not_available':
+        return 'Product not available. Please contact support.';
+      case 'storekit_purchase_invalid':
+        return 'Purchase invalid. Please try again.';
+      case 'storekit_purchase_not_allowed':
+        return 'Purchase not allowed. Please check your device settings.';
+      case 'storekit_purchase_cancelled':
+        return 'Purchase cancelled.';
+      default:
+        return 'Purchase failed: $message. Please try again.';
     }
   }
 
   Future<void> _setPremiumStatus(bool value) async {
     _isPremium = value;
     await Storage.savePremiumStatus(value);
+    // Sync premium status to Supabase
+    if (SupabaseService.isAuthenticated) {
+      try {
+        await SupabaseService.setPremiumStatus(
+          isPremium: value,
+          platform: Platform.isIOS ? 'ios' : 'android',
+        );
+      } catch (e) {
+        debugPrint('Failed to sync premium status: $e');
+      }
+    }
     notifyListeners();
+  }
+
+  /// Check remote premium status (called after sign in)
+  Future<void> syncPremiumFromRemote() async {
+    if (!SupabaseService.isAuthenticated) return;
+    try {
+      final remotePremium = await SupabaseService.fetchPremiumStatus();
+      if (remotePremium && !_isPremium) {
+        _isPremium = true;
+        await Storage.savePremiumStatus(true);
+        notifyListeners();
+      } else if (_isPremium && !remotePremium) {
+        // Local is premium, remote is not — push local to remote
+        await SupabaseService.setPremiumStatus(
+          isPremium: true,
+          platform: Platform.isIOS ? 'ios' : 'android',
+        );
+      }
+    } catch (e) {
+      debugPrint('Failed to sync premium from remote: $e');
+    }
+  }
+
+  // Debug only: Manually set premium status for testing
+  Future<void> setPremiumStatusForDebug(bool value) async {
+    await _setPremiumStatus(value);
   }
 
   Future<bool> buyPremium() async {
     try {
+      _lastPurchaseError = null; // Clear previous error
+      notifyListeners();
+      
       final available = await _inAppPurchase.isAvailable();
       if (!available) {
+        _lastPurchaseError = 'In-app purchases are not available on this device.';
+        notifyListeners();
+        debugPrint('In-app purchases not available');
         return false;
       }
 
@@ -480,11 +998,16 @@ class PremiumController extends ChangeNotifier {
       );
 
       if (productDetailsResponse.error != null) {
-        debugPrint('Product query error: ${productDetailsResponse.error}');
+        final error = productDetailsResponse.error!;
+        _lastPurchaseError = 'Failed to load product: ${error.message ?? "Unknown error"}. Please try again.';
+        notifyListeners();
+        debugPrint('Product query error: ${error.code} - ${error.message}');
         return false;
       }
 
       if (productDetailsResponse.productDetails.isEmpty) {
+        _lastPurchaseError = 'Product not found. Please make sure the app is up to date.';
+        notifyListeners();
         debugPrint('Product not found: $_kPremiumProductId');
         return false;
       }
@@ -494,8 +1017,17 @@ class PremiumController extends ChangeNotifier {
         productDetails: productDetails,
       );
 
-      return await _inAppPurchase.buyNonConsumable(purchaseParam: purchaseParam);
+      final result = await _inAppPurchase.buyNonConsumable(purchaseParam: purchaseParam);
+      
+      if (!result) {
+        _lastPurchaseError = 'Failed to initiate purchase. Please try again.';
+        notifyListeners();
+      }
+      
+      return result;
     } catch (e) {
+      _lastPurchaseError = 'An unexpected error occurred: $e. Please try again.';
+      notifyListeners();
       debugPrint('Buy premium error: $e');
       return false;
     }
@@ -503,9 +1035,16 @@ class PremiumController extends ChangeNotifier {
 
   Future<bool> restorePurchases() async {
     try {
+      _lastPurchaseError = null; // Clear previous error
+      notifyListeners();
+      
       await _inAppPurchase.restorePurchases();
+      // Note: restorePurchases() doesn't return a value, 
+      // the purchase stream will notify us of restored purchases
       return true;
     } catch (e) {
+      _lastPurchaseError = 'Failed to restore purchases: $e. Please try again.';
+      notifyListeners();
       debugPrint('Restore purchases error: $e');
       return false;
     }
@@ -527,11 +1066,9 @@ class ModeRules {
   String get displayName {
     switch (mode) {
       case FlowMode.scrum:
-        return 'Scrum';
+        return 'Sprint';
       case FlowMode.kanban:
         return 'Kanban';
-      case FlowMode.xp:
-        return 'XP';
     }
   }
 
@@ -539,8 +1076,6 @@ class ModeRules {
     switch (mode) {
       case FlowMode.kanban:
         return 2;
-      case FlowMode.xp:
-        return 1;
       case FlowMode.scrum:
         return null;
     }
@@ -569,27 +1104,72 @@ class ModeRules {
 /* ===================== Pomodoro Controller ===================== */
 
 class PomodoroController extends ChangeNotifier {
-  static const int workMinutes = 25;
-  static const int breakMinutes = 5;
+  // Default settings (Free)
+  static const int defaultWorkMinutes = 25;
+  static const int defaultBreakMinutes = 5;
+  
+  // Premium settings
+  static const int premiumWorkMinutes = 45;
+  static const int premiumBreakMinutes = 15;
 
   final String Function() dayKeyProvider;
   final List<Task> Function() doingTasksProvider;
   final Future<void> Function(PomodoroSession) onAppendSession;
+  final bool Function() isPremiumProvider;
 
   PomodoroPhase phase = PomodoroPhase.work;
-  int remainingSeconds = workMinutes * 60;
+  int remainingSeconds = defaultWorkMinutes * 60;
   bool running = false;
 
   Timer? _timer;
   DateTime? _phaseStartedAt;
   String? selectedDoingTaskId;
 
+  // Customizable settings (loaded from Storage)
+  int _workMinutes = defaultWorkMinutes;
+  int _breakMinutes = defaultBreakMinutes;
+
+  int get workMinutes => _workMinutes;
+  int get breakMinutes => _breakMinutes;
+
   PomodoroController({
     required this.dayKeyProvider,
     required this.doingTasksProvider,
     required this.onAppendSession,
+    required this.isPremiumProvider,
   }) {
+    _loadSettings();
     sync();
+  }
+
+  void _loadSettings() {
+    final settings = Storage.loadPomodoroSettings();
+    _workMinutes = settings['workMinutes'] as int? ?? defaultWorkMinutes;
+    _breakMinutes = settings['breakMinutes'] as int? ?? defaultBreakMinutes;
+    remainingSeconds = _workMinutes * 60;
+  }
+
+  /// Update pomodoro settings (Premium only)
+  Future<void> updateSettings({
+    required int workMinutes,
+    required int breakMinutes,
+  }) async {
+    if (!isPremiumProvider()) {
+      throw Exception('Pomodoro customization is a premium feature');
+    }
+    
+    _workMinutes = workMinutes;
+    _breakMinutes = breakMinutes;
+    await Storage.savePomodoroSettings({
+      'workMinutes': workMinutes,
+      'breakMinutes': breakMinutes,
+    });
+    
+    // Reset if not running
+    if (!running) {
+      remainingSeconds = _workMinutes * 60;
+    }
+    notifyListeners();
   }
 
   @override
@@ -610,7 +1190,7 @@ class PomodoroController extends ChangeNotifier {
   }
 
   int get _phaseMinutes =>
-      phase == PomodoroPhase.work ? workMinutes : breakMinutes;
+      phase == PomodoroPhase.work ? _workMinutes : _breakMinutes;
 
   int get _phaseTotalSeconds => _phaseMinutes * 60;
 
@@ -720,10 +1300,12 @@ class PomodoroController extends ChangeNotifier {
 
 class AppShell extends StatefulWidget {
   final void Function(bool) onDarkModeChanged;
+  final void Function(AppTheme)? onThemeChanged;
 
   const AppShell({
     super.key,
     required this.onDarkModeChanged,
+    this.onThemeChanged,
   });
 
   @override
@@ -756,6 +1338,7 @@ class _AppShellState extends State<AppShell> {
       const HistoryScreen(),
       SettingsScreen(
         onDarkModeChanged: widget.onDarkModeChanged,
+        onThemeChanged: widget.onThemeChanged,
       ),
     ];
 
@@ -798,6 +1381,8 @@ class _TodayScreenState extends State<TodayScreen> {
   bool _showCommittedOnly = false;
   bool _showRolledOverOnly = false;
   bool _isLoadingTasks = true;
+  Sprint? _completedSprint; // Review için tamamlanan sprint
+  bool _showCoreCompleteModal = false; // Core 5 tamamlandığında
 
   late FlowMode _mode;
   late ModeRules _rules;
@@ -847,6 +1432,7 @@ class _TodayScreenState extends State<TodayScreen> {
       doingTasksProvider: () =>
           _tasks.where((t) => t.status == TaskStatus.doing).toList(),
       onAppendSession: (s) => Storage.appendPomodoroSession(s),
+      isPremiumProvider: () => Provider.of<PremiumController>(context, listen: false).isPremium,
     );
     
     // Listen to pomodoro updates to refresh UI
@@ -903,13 +1489,58 @@ class _TodayScreenState extends State<TodayScreen> {
   }
 
   Future<void> _loadActive() async {
-    final loaded = Storage.loadActiveTasks();
-    setState(() {
-      _tasks
-        ..clear()
-        ..addAll(loaded);
-      _isLoadingTasks = false;
-    });
+    // Sprint otomatik başlat (Scrum mode için)
+    if (_rules.mode == FlowMode.scrum) {
+      final sprint = Storage.loadActiveSprint();
+      if (sprint != null && sprint.isPast()) {
+        // Sprint geçmişse, review ekranını göster
+        setState(() {
+          _completedSprint = sprint;
+        });
+        // Review tamamlandıktan sonra yeni sprint başlatılacak
+        return;
+      } else if (sprint == null) {
+        // Sprint yoksa, yeni sprint başlat
+        final newSprint = Sprint.createForThisWeek();
+        await Storage.saveActiveSprint(newSprint);
+        debugPrint('Sprint auto-started: ${newSprint.name}');
+      }
+    }
+    
+    // If authenticated, sync from remote first
+    if (SupabaseService.isAuthenticated) {
+      try {
+        final syncedTasks = await Storage.syncTasksFromRemote();
+        setState(() {
+          _tasks
+            ..clear()
+            ..addAll(syncedTasks);
+          _isLoadingTasks = false;
+        });
+      } catch (e) {
+        debugPrint('Failed to sync tasks from remote: $e');
+        // Fallback to local
+        final loaded = Storage.loadActiveTasks();
+        setState(() {
+          _tasks
+            ..clear()
+            ..addAll(loaded);
+          _isLoadingTasks = false;
+        });
+      }
+    } else {
+      // Not authenticated, just load local
+      final loaded = Storage.loadActiveTasks();
+      setState(() {
+        _tasks
+          ..clear()
+          ..addAll(loaded);
+        _isLoadingTasks = false;
+      });
+    }
+    if (_rules.mode == FlowMode.scrum) {
+      await Storage.cleanOrphanedSprintTaskIds(_tasks);
+    }
     _pomo.sync();
   }
 
@@ -924,7 +1555,18 @@ class _TodayScreenState extends State<TodayScreen> {
       isScrollControlled: true,
       showDragHandle: true,
       builder: (ctx) {
+        final sprint = Storage.loadActiveSprint();
+        final coreTasks = sprint != null
+            ? _tasks.where((t) => sprint.taskIds.contains(t.id)).toList()
+            : <Task>[];
+        final effectiveSprintCount = coreTasks.length;
+        final isCoreComplete = coreTasks.length == 5 &&
+            coreTasks.every((t) => t.status == TaskStatus.done);
         return _AddTaskSheet(
+          mode: _rules.mode,
+          currentTaskCount: _tasks.length,
+          effectiveSprintCount: effectiveSprintCount,
+          isCoreComplete: isCoreComplete,
           onAdd: (text) {
             _addTask(text);
                     Navigator.pop(ctx);
@@ -938,51 +1580,109 @@ class _TodayScreenState extends State<TodayScreen> {
     final title = text.trim();
     if (title.isEmpty) return;
 
-    // Premium gate: Free users limited to 15 tasks
-    final premium = Provider.of<PremiumController>(context, listen: false);
-    const freeTaskLimit = 15;
-    if (!premium.isPremium && _tasks.length >= freeTaskLimit) {
+    // HARD LIMIT: Core max 5 (Scrum mode)
+    if (_rules.mode == FlowMode.scrum) {
+      final sprint = Storage.loadActiveSprint();
+      final coreTasks = sprint != null
+          ? _tasks.where((t) => sprint.taskIds.contains(t.id)).toList()
+          : <Task>[];
+      final effectiveCount = coreTasks.length;
+      final isCoreComplete = effectiveCount == 5 &&
+          coreTasks.every((t) => t.status == TaskStatus.done);
+
+      if (sprint != null && effectiveCount >= 5 && !isCoreComplete) {
+        HapticFeedback.heavyImpact();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Your sprint is full.\nFinish something before adding more.'),
+            backgroundColor: context.themeWarning,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
+      if (sprint != null && effectiveCount == 4 && !isCoreComplete) {
+        HapticFeedback.mediumImpact(); // 1 slot remaining
+      }
+    }
+
+    // HARD LIMIT: Günlük focus max 3 task (doing durumunda)
+    final doingCount = _tasks.where((t) => t.status == TaskStatus.doing).length;
+    if (doingCount >= 3) {
+      HapticFeedback.heavyImpact(); // Error haptic
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.lock_outline, color: Colors.white),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text('Task limit reached ($freeTaskLimit tasks). Upgrade to Pro for unlimited tasks.'),
-              ),
-            ],
-          ),
+          content: const Text('Today\'s focus is full (3 tasks).\nComplete or move a task before adding more.'),
           backgroundColor: context.themeWarning,
           behavior: SnackBarBehavior.floating,
-          action: SnackBarAction(
-            label: 'Upgrade',
-            textColor: Colors.white,
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const PremiumScreen()),
-              );
-            },
-          ),
+          duration: const Duration(seconds: 3),
         ),
       );
       return;
     }
 
-    HapticFeedback.lightImpact();
+    // Premium gate: Free users limited to 15 tasks (non-scrum için)
+    if (_rules.mode != FlowMode.scrum) {
+      final premium = Provider.of<PremiumController>(context, listen: false);
+      const freeTaskLimit = 15;
+      if (!premium.isPremium && _tasks.length >= freeTaskLimit) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.lock_outline, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('Task limit reached ($freeTaskLimit tasks). Upgrade to Pro for unlimited tasks.'),
+                ),
+              ],
+            ),
+            backgroundColor: context.themeWarning,
+            behavior: SnackBarBehavior.floating,
+            action: SnackBarAction(
+              label: 'Upgrade',
+              textColor: Colors.white,
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const PremiumScreen()),
+                );
+              },
+            ),
+          ),
+        );
+        return;
+      }
+    }
+
+    HapticFeedback.lightImpact(); // Success haptic
+    final newTask = Task(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      title: title,
+      status: TaskStatus.todo,
+      focus: _focus,
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+    );
+    
     setState(() {
-      _tasks.add(
-        Task(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          title: title,
-          status: TaskStatus.todo,
-          focus: _focus,
-          createdAt: DateTime.now(),
-          updatedAt: DateTime.now(),
-        ),
-      );
+      _tasks.add(newTask);
     });
+    
+    // Sprint'e ekle: core veya stretch (scrum mode)
+    if (_rules.mode == FlowMode.scrum) {
+      final sprint = Storage.loadActiveSprint();
+      final coreTasks = _tasks.where((t) => sprint.taskIds.contains(t.id)).toList();
+      final isCoreComplete = coreTasks.length == 5 &&
+          coreTasks.every((t) => t.status == TaskStatus.done);
+      if (isCoreComplete || coreTasks.length >= 5) {
+        Storage.addTaskToStretch(newTask.id);
+      } else {
+        Storage.addTaskToSprint(newTask.id);
+      }
+    }
+    
     _persist();
   }
 
@@ -994,25 +1694,64 @@ class _TodayScreenState extends State<TodayScreen> {
       builder: (ctx) {
         return _EditTaskSheet(
           task: t,
-          onSave: (newTitle, newFocus) {
-                        setState(() {
-                          t.title = newTitle;
+          onSave: (newTitle, newFocus, tags, dueDate) {
+            setState(() {
+              t.title = newTitle;
               t.focus = newFocus;
-                          t.updatedAt = DateTime.now();
-                        });
-                        _persist();
-                        Navigator.pop(ctx);
-                      },
+              t.tags = tags;
+              t.dueDate = dueDate;
+              t.updatedAt = DateTime.now();
+            });
+            _persist();
+            Navigator.pop(ctx);
+          },
         );
       },
     );
   }
 
-  void _deleteTask(Task t) {
-    HapticFeedback.mediumImpact();
-    setState(() => _tasks.removeWhere((x) => x.id == t.id));
+  void _duplicateTask(Task t) {
+    HapticFeedback.lightImpact();
+    final now = DateTime.now();
+    final duplicated = Task(
+      id: now.millisecondsSinceEpoch.toString(),
+      title: '${t.title} (copy)',
+      status: TaskStatus.todo,
+      focus: t.focus,
+      createdAt: now,
+      updatedAt: now,
+      tags: List.from(t.tags),
+      dueDate: t.dueDate,
+    );
+    setState(() {
+      _tasks.add(duplicated);
+    });
     _persist();
     ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Duplicated "${t.title}"'),
+        duration: const Duration(seconds: 1),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _deleteTask(Task t) {
+    HapticFeedback.mediumImpact();
+    // Defer removal to next frame to avoid _dependents.isEmpty when PopupMenu is closing
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      setState(() => _tasks.removeWhere((x) => x.id == t.id));
+      if (_mode == FlowMode.scrum) {
+        await Storage.removeTaskFromSprint(t.id);
+      }
+      if (SupabaseService.isAuthenticated) {
+        SupabaseService.deleteTask(t.id).catchError((e) =>
+            debugPrint('Failed to delete task from remote: $e'));
+      }
+      _persist();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text('Deleted "${t.title}"'),
         duration: const Duration(seconds: 1),
@@ -1020,16 +1759,47 @@ class _TodayScreenState extends State<TodayScreen> {
         action: SnackBarAction(
           label: 'Undo',
           textColor: Colors.white,
-          onPressed: () {
+          onPressed: () async {
             HapticFeedback.lightImpact();
             setState(() {
               _tasks.add(t);
             });
+            if (_mode == FlowMode.scrum) {
+              final sprint = Storage.loadActiveSprint();
+              final coreCount = _tasks.where((x) => sprint.taskIds.contains(x.id)).length;
+              if (coreCount < 5) {
+                await Storage.addTaskToSprint(t.id);
+              } else {
+                await Storage.addTaskToStretch(t.id);
+              }
+            }
             _persist();
           },
         ),
       ),
     );
+    });
+  }
+
+  Future<void> _addStretchToSprint(Task t) async {
+    final success = await Storage.moveTaskFromStretchToCore(t.id);
+    if (success && mounted) {
+      setState(() {});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Added "${t.title}" to sprint'),
+          duration: const Duration(seconds: 1),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Sprint is full (5/5).'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   void _toggleCommit(Task t) {
@@ -1079,6 +1849,24 @@ class _TodayScreenState extends State<TodayScreen> {
   }
 
   void _toDoing(Task t) {
+    // Focus sadece core 5'ten (Scrum mode)
+    if (_rules.mode == FlowMode.scrum) {
+      final sprint = Storage.loadActiveSprint();
+      if (sprint != null && !sprint.taskIds.contains(t.id)) {
+        HapticFeedback.heavyImpact();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'Focus is only for sprint commitments. Extra tasks stay in Backlog.',
+            ),
+            backgroundColor: context.themeWarning.withOpacity(0.9),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
+    }
     if (!_rules.canMoveToDoing(_tasks)) {
       HapticFeedback.heavyImpact();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1112,12 +1900,25 @@ class _TodayScreenState extends State<TodayScreen> {
   }
 
   void _toDone(Task t) {
-    HapticFeedback.mediumImpact();
+    HapticFeedback.mediumImpact(); // Success haptic
     setState(() {
       t.status = TaskStatus.done;
       t.updatedAt = DateTime.now();
     });
     _persist();
+    
+    // Sprint slot tamamlandığında (eğer sprint task'ı ise)
+    if (_rules.mode == FlowMode.scrum) {
+      final sprint = Storage.loadActiveSprint();
+      if (sprint != null && sprint.taskIds.contains(t.id)) {
+        final sprintTasks = _tasks.where((t) => sprint.taskIds.contains(t.id)).toList();
+        final completed = sprintTasks.where((x) => x.status == TaskStatus.done).length;
+        if (sprintTasks.length == 5 && completed == 5) {
+          HapticFeedback.heavyImpact();
+          setState(() => _showCoreCompleteModal = true);
+        }
+      }
+    }
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -1200,14 +2001,14 @@ class _TodayScreenState extends State<TodayScreen> {
     );
     await Storage.saveDayLog(log);
 
-    // Rollover: keep todo + doing, drop done. Reset commitment for new day.
+    // Rollover: keep todo + doing, drop done. Commitment does NOT reset (user manually selects)
     final carried = _tasks
         .where((t) => t.status != TaskStatus.done)
         .map((t) => t.copyWith(
               updatedAt: DateTime.now(),
               rolledOver: true,
               carriedOverFromDay: todayKey,
-              committedToday: false,
+              // committedToday stays as is - user manually selects
             ))
         .toList();
 
@@ -1267,11 +2068,14 @@ widget.onOpenHistory();
     // Apply filters
     var visible = _tasks.where((t) => t.focus == _focus).toList();
     
-    // Search filter
+    // Search filter (title and tags)
     if (_searchQuery.isNotEmpty) {
-      visible = visible.where((t) => 
-        t.title.toLowerCase().contains(_searchQuery.toLowerCase())
-      ).toList();
+      final query = _searchQuery.toLowerCase();
+      visible = visible.where((t) {
+        final titleMatch = t.title.toLowerCase().contains(query);
+        final tagMatch = t.tags.any((tag) => tag.toLowerCase().contains(query));
+        return titleMatch || tagMatch;
+      }).toList();
     }
     
     // Committed only filter
@@ -1288,6 +2092,25 @@ widget.onOpenHistory();
     final doing = visible.where((t) => t.status == TaskStatus.doing).toList();
     final done = visible.where((t) => t.status == TaskStatus.done).toList();
 
+    // Scrum: core vs stretch split
+    final sprint = _rules.mode == FlowMode.scrum ? Storage.loadActiveSprint() : null;
+    final coreTodo = sprint != null
+        ? todo.where((t) => sprint.taskIds.contains(t.id)).toList()
+        : todo;
+    final coreDoing = sprint != null
+        ? doing.where((t) => sprint.taskIds.contains(t.id)).toList()
+        : doing;
+    final coreDone = sprint != null
+        ? done.where((t) => sprint.taskIds.contains(t.id)).toList()
+        : done;
+    final stretchTodo = sprint != null
+        ? todo.where((t) => sprint.stretchTaskIds.contains(t.id)).toList()
+        : <Task>[];
+    final stretchDone = sprint != null
+        ? done.where((t) => sprint.stretchTaskIds.contains(t.id)).toList()
+        : <Task>[];
+    final stretchTasks = [...stretchTodo, ...stretchDone];
+
     final wip = _rules.wipLimit;
     final wipLabel = wip == null ? 'No WIP' : 'WIP $doingCount/$wip';
 
@@ -1298,8 +2121,48 @@ widget.onOpenHistory();
 
     // Pomodoro status
     final pomodoroStatus = _pomo.running
-        ? '🍅 ${_pomo.remainingText}'
+        ? _pomo.remainingText
         : null;
+
+    // Core 5 tamamlandığında celebration modal
+    if (_showCoreCompleteModal) {
+      final sprint = Storage.loadActiveSprint();
+      if (sprint != null) {
+        return _CoreCompleteModal(
+          onReviewSprint: () {
+            setState(() {
+              _showCoreCompleteModal = false;
+              _completedSprint = sprint;
+            });
+          },
+          onAddStretch: () {
+            setState(() => _showCoreCompleteModal = false);
+            // Stretch model (item 2) burada aktif olacak
+          },
+        );
+      }
+    }
+
+    // Sprint review ekranı (sprint bitince veya Review sprint'ten)
+    if (_completedSprint != null) {
+      return _SprintReviewScreen(
+        sprint: _completedSprint!,
+        tasks: _tasks,
+        onComplete: () async {
+          // Sprint'i geçmişe ekle
+          await Storage.archiveSprint(_completedSprint!);
+          // Yeni sprint başlat
+          final newSprint = Sprint.createForThisWeek();
+          await Storage.saveActiveSprint(newSprint);
+          // Review'i kapat
+          setState(() {
+            _completedSprint = null;
+          });
+          // Taskları yükle
+          await _loadActive();
+        },
+      );
+    }
 
     return Scaffold(
       backgroundColor: context.themeBg,
@@ -1325,28 +2188,82 @@ widget.onOpenHistory();
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(14),
-          child: Column(
-            children: [
-              _HeaderCard(
-                title: 'Today',
-                subtitle: [
-                  _rules.displayName,
-                  wipLabel,
-                  if (commitLabel != null) commitLabel,
-                  if (pomodoroStatus != null) pomodoroStatus,
-                ].join(' • '),
-                leftStatLabel: 'Doing',
-                leftStatValue: wip == null ? '$doingCount' : '$doingCount/$wip',
-                leftStatWipLimit: wip,
-                leftStatDoingCount: doingCount,
-                midStatLabel: 'Done',
-                midStatValue: '$doneCount',
-                rightStatLabel: 'Focus',
-                rightStatValue: titleCase(_focus.name),
-                onSettings: widget.onOpenSettings ?? () {},
-                onPomodoro: _openDeepFocus,
-                onEndDay: _endDay,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+              // Minimal header: Başlık + action butonları
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Today',
+                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+                      ),
+                      if (_rules.mode == FlowMode.scrum) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          _rules.displayName,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: context.themeTextMuted,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      TopIconButton(
+                        icon: Icons.settings_rounded,
+                        tooltip: 'Settings',
+                        onTap: widget.onOpenSettings ?? () {},
+                      ),
+                      const SizedBox(width: 6),
+                      TopIconButton(
+                        icon: Icons.timer_rounded,
+                        tooltip: 'Deep Focus',
+                        onTap: _openDeepFocus,
+                      ),
+                      const SizedBox(width: 6),
+                      TopIconButton(
+                        icon: Icons.nightlight_round,
+                        tooltip: 'End Day',
+                        onTap: _endDay,
+                      ),
+                    ],
+                  ),
+                ],
               ),
+              const SizedBox(height: 8),
+              // Hafta içi / hafta sonu focus mesajı
+              Builder(
+                builder: (context) {
+                  final wd = DateTime.now().weekday;
+                  final isWeekend = wd == DateTime.saturday || wd == DateTime.sunday;
+                  return Text(
+                    isWeekend
+                        ? 'Optional focus for today.'
+                        : 'Today needs at least one focus.',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: context.themeTextMuted,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(height: AppSpacing.md),
+              // Sprint Overview (sadece Scrum mode için)
+              if (_rules.mode == FlowMode.scrum) ...[
+                _SprintOverviewCard(tasks: _tasks),
+                const SizedBox(height: AppSpacing.md),
+              ],
+              // Günlük Focus: 3 slot görseli
+              _DailyFocusSlots(doingCount: doingCount),
               const SizedBox(height: AppSpacing.md),
               _FocusPills(
                 selected: _focus,
@@ -1362,62 +2279,80 @@ widget.onOpenHistory();
                 onRolledOverToggle: (value) => setState(() => _showRolledOverOnly = value),
               ),
               const SizedBox(height: 12),
-              Expanded(
-                child: _isLoadingTasks
-                    ? const _TodaySkeleton()
-                    : SingleChildScrollView(
-                  child: Column(
-                    children: [
-                      _SectionCard(
-                        title: 'To do',
-                        count: todo.length,
-                        child: _TaskList(
-                          tasks: todo,
-                          mode: _mode,
-                          onMoveForward: _toDoing,
-                          onMoveBack: null,
-                          onTapTask: _editTask,
-                          onDeleteTask: _deleteTask,
-                          onToggleCommit: _toggleCommit,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      _SectionCard(
-                        title: 'Doing',
-                        count: doing.length,
-                        child: _TaskList(
-                          tasks: doing,
-                          mode: _mode,
-                          onMoveForward: _toDone,
-                          onMoveBack: _toTodo,
-                          onTapTask: _editTask,
-                          onDeleteTask: _deleteTask,
-                          onToggleCommit: _toggleCommit,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      _SectionCard(
-                        title: 'Done',
-                        count: done.length,
-                        child: _TaskList(
-                          tasks: done,
-  mode: _mode,
-  onMoveForward: null,
-  onMoveBack: _toDoing,
-  dimmed: true,
-                                disableSwipeForward:
-                                    true, // ✅ Done’da swipe right kapalı
-  onTapTask: _editTask,
-  onDeleteTask: _deleteTask,
-  onToggleCommit: _toggleCommit,
-),
-                      ),
-                      const SizedBox(height: 24),
-                    ],
+              if (_isLoadingTasks)
+                const SizedBox(height: 200, child: _TodaySkeleton())
+              else ...[
+                if (_rules.mode == FlowMode.scrum && stretchTasks.isNotEmpty) ...[
+                  _SectionCard(
+                    title: 'Backlog (Stretch)',
+                    count: stretchTasks.length,
+                    child: _TaskList(
+                      tasks: stretchTasks,
+                      mode: _mode,
+                      onMoveForward: null,
+                      onMoveBack: null,
+                      onTapTask: _editTask,
+                      onDeleteTask: _deleteTask,
+                      onToggleCommit: (_) {},
+                      onDuplicateTask: _duplicateTask,
+                      onAddToSprint: coreTodo.length + coreDoing.length + coreDone.length < 5
+                          ? _addStretchToSprint
+                          : null,
+                      disableSwipeForward: true,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                _SectionCard(
+                  title: _rules.mode == FlowMode.scrum ? 'Sprint Commitments' : 'To do',
+                  count: _rules.mode == FlowMode.scrum ? coreTodo.length : todo.length,
+                  child: _TaskList(
+                    tasks: _rules.mode == FlowMode.scrum ? coreTodo : todo,
+                    mode: _mode,
+                    onMoveForward: _toDoing,
+                    onMoveBack: null,
+                    onTapTask: _editTask,
+                    onDeleteTask: _deleteTask,
+                    onToggleCommit: _toggleCommit,
+                    onDuplicateTask: _duplicateTask,
                   ),
                 ),
-              ),
+                const SizedBox(height: 12),
+                _SectionCard(
+                  title: 'Focused',
+                  count: _rules.mode == FlowMode.scrum ? coreDoing.length : doing.length,
+                  child: _TaskList(
+                    tasks: _rules.mode == FlowMode.scrum ? coreDoing : doing,
+                    mode: _mode,
+                    onMoveForward: _toDone,
+                    onMoveBack: _toTodo,
+                    onTapTask: _editTask,
+                    onDeleteTask: _deleteTask,
+                    onToggleCommit: _toggleCommit,
+                    onDuplicateTask: _duplicateTask,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _SectionCard(
+                  title: 'Done',
+                  count: _rules.mode == FlowMode.scrum ? coreDone.length : done.length,
+                  child: _TaskList(
+                    tasks: _rules.mode == FlowMode.scrum ? coreDone : done,
+                    mode: _mode,
+                    onMoveForward: null,
+                    onMoveBack: _toDoing,
+                    dimmed: true,
+                    disableSwipeForward: true,
+                    onTapTask: _editTask,
+                    onDeleteTask: _deleteTask,
+                    onToggleCommit: _toggleCommit,
+                    onDuplicateTask: _duplicateTask,
+                  ),
+                ),
+                const SizedBox(height: 24),
+              ],
             ],
+            ),
           ),
         ),
       ),
@@ -1490,7 +2425,7 @@ class _PomodoroScreenState extends State<PomodoroScreen> {
     return Scaffold(
       backgroundColor: context.themeBg,
       appBar: AppBar(
-        title: const Text('🍅 Deep Focus'),
+        title: const Text('Deep Focus'),
         backgroundColor: Colors.transparent,
       ),
       body: SafeArea(
@@ -1580,7 +2515,7 @@ class _PomodoroScreenState extends State<PomodoroScreen> {
                       const SizedBox(height: 10),
                       Text(
                         'Deep Focus is optional.\n'
-                        'Move a task to Doing, then use 🍅 when you want to focus.\n'
+                        'Move a task to Doing, then use Deep Focus when you want to focus.\n'
                         'Work sessions are logged; breaks are not tied to tasks.',
                         style: TextStyle(color: context.themeTextMuted),
                       ),
@@ -1735,7 +2670,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     ),
                     const SizedBox(width: AppSpacing.sm),
                     _HistoryFilterChip(
-                      label: 'Scrum',
+                      label: 'Sprint',
                       selected: _filter == FlowMode.scrum,
                       onSelected: () {
                         setState(() => _filter = FlowMode.scrum);
@@ -1749,18 +2684,15 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         setState(() => _filter = FlowMode.kanban);
                       },
                     ),
-                    const SizedBox(width: AppSpacing.sm),
-                    _HistoryFilterChip(
-                      label: 'XP',
-                      selected: _filter == FlowMode.xp,
-                      onSelected: () {
-                        setState(() => _filter = FlowMode.xp);
-                      },
-                    ),
                   ],
                 ),
               ),
               const SizedBox(height: 12),
+              // Premium: Sprint History
+              if (premium.isPremium) ...[
+                _SprintHistorySection(),
+                const SizedBox(height: 12),
+              ],
               if (lastDays.isNotEmpty)
                 _StatsCard(
                   totalTasksDone: totalTasksDone,
@@ -1814,7 +2746,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         dayKey: log.dayKey,
                         emoji: moodToEmoji(log.mood),
                         subtitle:
-                            '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • 🍅 $pomos ($focusMinutes min)$commitBadge',
+                            '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • Focus $pomos ($focusMinutes min)$commitBadge',
                         onTap: () {
                           Navigator.push(
                             context,
@@ -1917,7 +2849,7 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
                       ),
                       const SizedBox(height: 12),
                       _SectionCard(
-                        title: 'Doing',
+                        title: 'Focused',
                         count: doing.length,
                         child: _ReadOnlyTaskList(tasks: doing),
                       ),
@@ -1944,10 +2876,12 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
 
 class SettingsScreen extends StatefulWidget {
   final void Function(bool) onDarkModeChanged;
+  final void Function(AppTheme)? onThemeChanged;
 
   const SettingsScreen({
     super.key,
     required this.onDarkModeChanged,
+    this.onThemeChanged,
   });
 
   @override
@@ -1957,12 +2891,14 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late FlowMode _mode;
   late bool _darkMode;
+  late AppTheme _theme;
 
   @override
   void initState() {
     super.initState();
     _mode = Storage.loadMode();
     _darkMode = Storage.loadDarkMode();
+    _theme = Storage.loadTheme();
   }
 
   Future<void> _setMode(FlowMode m) async {
@@ -1974,6 +2910,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _darkMode = value);
     await Storage.saveDarkMode(value);
     widget.onDarkModeChanged(value);
+  }
+
+  Future<void> _setTheme(AppTheme theme) async {
+    setState(() => _theme = theme);
+    await Storage.saveTheme(theme);
+    widget.onThemeChanged?.call(theme);
   }
 
   @override
@@ -1999,17 +2941,80 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const Text('Settings',
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
               const SizedBox(height: 12),
+              _AccountSection(onSyncComplete: () {
+                // Refresh the settings screen after sync
+                setState(() {});
+              }),
+              const SizedBox(height: 12),
               _SectionCard(
                 title: 'Appearance',
                 count: 0,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Dark Mode',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-                    Switch(
-                      value: _darkMode,
-                      onChanged: _setDarkMode,
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Dark Mode',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                        Switch(
+                          value: _darkMode,
+                          onChanged: _setDarkMode,
+                        ),
+                      ],
+                    ),
+                    Consumer<PremiumController>(
+                      builder: (context, premium, _) {
+                        if (!premium.isPremium) {
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: Row(
+                              children: [
+                                Icon(Icons.lock_outline, size: 16, color: context.themeTextMuted),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    'Themes are available in Leanly Pro',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: context.themeTextMuted,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const SizedBox(height: 16),
+                            const Text(
+                              'Theme',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                            ),
+                            const SizedBox(height: 12),
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
+                              children: AppTheme.values.map((theme) {
+                                final isSelected = theme == _theme;
+                                return ChoiceChip(
+                                  selected: isSelected,
+                                  label: Text(AppThemes.getDisplayName(theme)),
+                                  onSelected: (_) => _setTheme(theme),
+                                  selectedColor: context.themeAccent,
+                                  backgroundColor: context.themeCard,
+                                  labelStyle: TextStyle(
+                                    color: isSelected ? Colors.white : null,
+                                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ],
+                        );
+                      },
                     ),
                   ],
                 ),
@@ -2023,12 +3028,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     Wrap(
                       spacing: 10,
+                      runSpacing: 10,
                       children: FlowMode.values.map((m) {
                         final on = m == _mode;
-                        return ChoiceChip(
-                          selected: on,
-                          label: Text(ModeRules(m).displayName),
-                          onSelected: (_) => _setMode(m),
+                        final isKanban = m == FlowMode.kanban;
+                        return Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            ChoiceChip(
+                              selected: on,
+                              label: Text(ModeRules(m).displayName),
+                              onSelected: (_) => _setMode(m),
+                            ),
+                            if (isKanban) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: context.themeTextMuted.withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  'Advanced',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: context.themeTextMuted,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         );
                       }).toList(),
                     ),
@@ -2037,11 +3067,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         style: TextStyle(color: context.themeTextMuted)),
                     const SizedBox(height: 8),
                     Text(
-                      'Kanban/XP: WIP blocks moving into Doing.\nScrum: daily commitment caps your plan (3 tasks).',
+                      'Sprint: 5 commitments per week, up to 3 daily focus.\nKanban: Advanced mode with WIP limits.',
                       style: TextStyle(color: context.themeTextMuted),
                     ),
                   ],
                 ),
+              ),
+              const SizedBox(height: 12),
+              // Pomodoro Settings (Premium)
+              Consumer<PremiumController>(
+                builder: (context, premium, _) {
+                  if (!premium.isPremium) {
+                    return _SectionCard(
+                      title: 'Pomodoro Settings',
+                      count: 0,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.lock_outline, size: 16, color: context.themeTextMuted),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  'Customize Pomodoro settings in Leanly Pro',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: context.themeTextMuted,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Default: 25 min focus, 5 min rest',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: context.themeTextMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
+                  
+                  // Premium: Customizable pomodoro
+                  final settings = Storage.loadPomodoroSettings();
+                  final workMinutes = settings['workMinutes'] as int? ?? PomodoroController.defaultWorkMinutes;
+                  final breakMinutes = settings['breakMinutes'] as int? ?? PomodoroController.defaultBreakMinutes;
+                  
+                  return _PomodoroSettingsCard(
+                    workMinutes: workMinutes,
+                    breakMinutes: breakMinutes,
+                    onSettingsChanged: (work, break_) async {
+                      await Storage.savePomodoroSettings({
+                        'workMinutes': work,
+                        'breakMinutes': break_,
+                      });
+                      setState(() {});
+                    },
+                  );
+                },
               ),
               const SizedBox(height: 12),
               Consumer<PremiumController>(
@@ -2151,7 +3238,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Personal task planner inspired by agile workflows (Scrum, Kanban, XP).',
+                      'Personal task planner inspired by agile workflows (Sprint, Kanban).',
                       style: TextStyle(
                         fontSize: 13,
                         color: context.themeTextMuted,
@@ -2161,13 +3248,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     Row(
                       children: [
                         const Icon(
-                          Icons.privacy_tip_outlined,
+                          Icons.cloud_done_outlined,
                           size: 18,
                         ),
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'All data is stored locally on this device. No accounts, no cloud sync.',
+                            SupabaseService.isAuthenticated
+                                ? 'Your data is synced across devices.'
+                                : 'Sign in to sync data across devices.',
                             style: TextStyle(
                               fontSize: 13,
                               color: context.themeTextMuted,
@@ -2179,6 +3268,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                 ),
               ),
+              // Debug: Premium toggle (only in debug mode)
+              if (kDebugMode) ...[
+                const SizedBox(height: 12),
+                _SectionCard(
+                  title: 'Debug',
+                  count: 0,
+                  child: Consumer<PremiumController>(
+                    builder: (context, premium, _) {
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text(
+                                'Premium Status (Debug)',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              Switch(
+                                value: premium.isPremium,
+                                onChanged: (value) async {
+                                  final controller = Provider.of<PremiumController>(context, listen: false);
+                                  await controller.setPremiumStatusForDebug(value);
+                                },
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            premium.isPremium
+                                ? 'Premium is ACTIVE (Debug Mode)'
+                                : 'Premium is INACTIVE (Debug Mode)',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: context.themeTextMuted,
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
             ],
             ),
           ),
@@ -2301,10 +3436,14 @@ class _PremiumScreenState extends State<PremiumScreen> {
                               ),
                             );
                           } else {
+                            // Show detailed error message if available
+                            final errorMessage = premium.lastPurchaseError ?? 
+                                'Purchase failed. Please try again.';
                             ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Purchase failed. Please try again.'),
+                              SnackBar(
+                                content: Text(errorMessage),
                                 behavior: SnackBarBehavior.floating,
+                                duration: const Duration(seconds: 4),
                               ),
                             );
                           }
@@ -2410,6 +3549,799 @@ class _MoodChip extends StatelessWidget {
     return ActionChip(
       label: Text('$emoji  $label'),
       onPressed: onTap,
+    );
+  }
+}
+
+class _CoreCompleteModal extends StatelessWidget {
+  final VoidCallback onReviewSprint;
+  final VoidCallback onAddStretch;
+
+  const _CoreCompleteModal({
+    required this.onReviewSprint,
+    required this.onAddStretch,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: context.themeBg,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Spacer(),
+              Text(
+                'Sprint completed.',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w700,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'You finished all 5 commitments for this week.',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  color: context.themeTextMuted,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'You stayed within your limits.',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: context.themeTextMuted,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const Spacer(),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: onReviewSprint,
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text(
+                    'Review sprint',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: onAddStretch,
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text(
+                    'Add stretch commitment',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SprintReviewScreen extends StatefulWidget {
+  final Sprint sprint;
+  final List<Task> tasks;
+  final VoidCallback onComplete;
+
+  const _SprintReviewScreen({
+    required this.sprint,
+    required this.tasks,
+    required this.onComplete,
+  });
+
+  @override
+  State<_SprintReviewScreen> createState() => _SprintReviewScreenState();
+}
+
+class _SprintReviewScreenState extends State<_SprintReviewScreen> {
+  final TextEditingController _finishedController = TextEditingController();
+  final TextEditingController _unfinishedController = TextEditingController();
+  final TextEditingController _nextCommitController = TextEditingController();
+
+  @override
+  void dispose() {
+    _finishedController.dispose();
+    _unfinishedController.dispose();
+    _nextCommitController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sprintTasks = widget.tasks.where((t) => widget.sprint.taskIds.contains(t.id)).toList();
+    final completed = sprintTasks.where((t) => t.status == TaskStatus.done).toList();
+    final unfinished = sprintTasks.where((t) => t.status != TaskStatus.done).toList();
+    final percentage = widget.sprint.completionPercentage(widget.tasks);
+    final stretchTasks = widget.tasks.where((t) => widget.sprint.stretchTaskIds.contains(t.id)).toList();
+    final stretchCompleted = stretchTasks.where((t) => t.status == TaskStatus.done).toList();
+
+    return Scaffold(
+      backgroundColor: context.themeBg,
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Sprint Review',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                widget.sprint.name,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: context.themeTextMuted,
+                ),
+              ),
+              const SizedBox(height: 24),
+              // Completion summary
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: context.themeCard,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Column(
+                  children: [
+                    TweenAnimationBuilder<double>(
+                      tween: Tween(begin: 0.0, end: percentage / 100),
+                      duration: const Duration(milliseconds: 1000),
+                      curve: Curves.easeOutCubic,
+                      builder: (context, value, child) {
+                        final isComplete = percentage >= 100;
+                        return Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            SizedBox(
+                              width: 80,
+                              height: 80,
+                              child: CircularProgressIndicator(
+                                value: value,
+                                strokeWidth: 8,
+                                backgroundColor: context.themeSoftRow,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  isComplete ? Colors.green : context.themeAccent,
+                                ),
+                              ),
+                            ),
+                            Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (isComplete)
+                                  TweenAnimationBuilder<double>(
+                                    tween: Tween(begin: 0.0, end: 1.0),
+                                    duration: const Duration(milliseconds: 600),
+                                    curve: Curves.elasticOut,
+                                    builder: (context, scale, _) {
+                                      return Transform.scale(
+                                        scale: scale,
+                                        child: const Text(
+                                          '🎉',
+                                          style: TextStyle(fontSize: 24),
+                                        ),
+                                      );
+                                    },
+                                  )
+                                else
+                                  Text(
+                                    '${(value * 100).toStringAsFixed(0)}%',
+                                    style: TextStyle(
+                                      fontSize: 20,
+                                      fontWeight: FontWeight.w700,
+                                      color: context.themeAccent,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      '${completed.length}/${sprintTasks.length} tasks completed',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (percentage >= 100) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Perfect sprint! 🚀',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.green,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (stretchTasks.isNotEmpty) ...[
+                const SizedBox(height: 24),
+                Text(
+                  'Extra effort',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: context.themeTextMuted,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: context.themeSoftRow,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: stretchTasks.map((t) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            t.status == TaskStatus.done ? Icons.check_circle : Icons.radio_button_unchecked,
+                            color: t.status == TaskStatus.done ? context.themeAccent : context.themeTextMuted,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              t.title,
+                              style: TextStyle(
+                                fontSize: 14,
+                                decoration: t.status == TaskStatus.done ? TextDecoration.lineThrough : null,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )).toList(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${stretchCompleted.length}/${stretchTasks.length} stretch completed',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: context.themeTextMuted,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 32),
+              // Question 1: What did you finish?
+              Text(
+                'What did you finish?',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: context.themeAccent,
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (completed.isNotEmpty) ...[
+                ...completed.map((task) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: InkWell(
+                    onTap: () {
+                      // Auto-fill: Task'ı text field'a ekle
+                      final current = _finishedController.text;
+                      final newText = current.isEmpty
+                          ? task.title
+                          : '$current\n• ${task.title}';
+                      _finishedController.text = newText;
+                    },
+                    borderRadius: BorderRadius.circular(12),
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: context.themeSoftRow,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: context.themeAccent.withOpacity(0.3),
+                          width: 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.check_circle, color: context.themeAccent, size: 20),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              task.title,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                          Icon(
+                            Icons.add_circle_outline,
+                            size: 16,
+                            color: context.themeTextMuted,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )),
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: _finishedController,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  hintText: completed.isEmpty
+                      ? 'Reflect on what you accomplished...'
+                      : 'Tap tasks above to add them, or write your own reflection...',
+                  filled: true,
+                  fillColor: context.themeCard,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              // Question 2: What stayed unfinished?
+              Text(
+                'What stayed unfinished?',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: context.themeTextMuted,
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (unfinished.isNotEmpty) ...[
+                ...unfinished.map((task) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: InkWell(
+                    onTap: () {
+                      // Auto-fill: Task'ı text field'a ekle
+                      final current = _unfinishedController.text;
+                      final newText = current.isEmpty
+                          ? task.title
+                          : '$current\n• ${task.title}';
+                      _unfinishedController.text = newText;
+                    },
+                    borderRadius: BorderRadius.circular(12),
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: context.themeSoftRow,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: context.themeTextMuted.withOpacity(0.3),
+                          width: 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.radio_button_unchecked, color: context.themeTextMuted, size: 20),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              task.title,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+                          Icon(
+                            Icons.add_circle_outline,
+                            size: 16,
+                            color: context.themeTextMuted,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )),
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: _unfinishedController,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  hintText: unfinished.isEmpty
+                      ? 'What didn\'t get done and why?'
+                      : 'Tap tasks above to add them, or write your own reflection...',
+                  filled: true,
+                  fillColor: context.themeCard,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              // Question 3: What will you commit to next?
+              Text(
+                'What will you commit to next?',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: context.themeAccent,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _nextCommitController,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  hintText: 'What are your priorities for the next sprint?',
+                  filled: true,
+                  fillColor: context.themeCard,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 32),
+              // Complete button
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: widget.onComplete,
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text(
+                    'Start Next Sprint',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SprintOverviewCard extends StatelessWidget {
+  final List<Task> tasks;
+
+  const _SprintOverviewCard({required this.tasks});
+
+  @override
+  Widget build(BuildContext context) {
+    final sprint = Storage.loadActiveSprint();
+    final completed = sprint.completedCount(tasks);
+    final total = sprint.totalCount();
+    final percentage = sprint.completionPercentage(tasks);
+
+    // Empty state: İlk sprint, hiç task yok
+    if (total == 0) {
+      return Container(
+        padding: const EdgeInsets.all(AppSpacing.lg),
+        decoration: BoxDecoration(
+          color: context.themeCard,
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.03),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      sprint.name,
+                      style: const TextStyle(
+                        fontSize: AppTypography.lg,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'This Week',
+                      style: TextStyle(
+                        fontSize: AppTypography.sm,
+                        color: context.themeTextMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Center(
+              child: Column(
+                children: [
+                  Icon(
+                    Icons.rocket_launch,
+                    size: 48,
+                    color: context.themeAccent.withOpacity(0.5),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Welcome to your first sprint!',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: context.themeTextMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Add your first task to get started',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: context.themeTextMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: AppSpacing.md),
+            // 5 boş slot göster
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: List.generate(5, (index) {
+                return Expanded(
+                  child: Container(
+                    margin: EdgeInsets.only(right: index < 4 ? 8 : 0),
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: context.themeSoftRow.withOpacity(0.5),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: context.themeTextMuted.withOpacity(0.2),
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Center(
+                      child: Icon(
+                        Icons.add_circle_outline,
+                        color: context.themeTextMuted.withOpacity(0.4),
+                        size: 20,
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      decoration: BoxDecoration(
+        color: context.themeCard,
+        borderRadius: BorderRadius.circular(18),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.03),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    sprint.name,
+                    style: const TextStyle(
+                      fontSize: AppTypography.lg,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'This Week',
+                    style: TextStyle(
+                      fontSize: AppTypography.sm,
+                      color: context.themeTextMuted,
+                    ),
+                  ),
+                ],
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: context.themeAccent.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '${percentage.toStringAsFixed(0)}%',
+                  style: TextStyle(
+                    fontSize: AppTypography.lg,
+                    fontWeight: FontWeight.w700,
+                    color: context.themeAccent,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.md),
+          // 5 Slot görseli - psikolojik baskı için (animasyonlu)
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: List.generate(5, (index) {
+              final isFilled = index < total;
+              final isCompleted = index < completed;
+              
+              // Color coding: Completed = green accent, In progress = yellow, Empty = gray
+              final slotColor = isCompleted
+                  ? context.themeAccent // Green for completed
+                  : isFilled
+                      ? Colors.orange.withOpacity(0.3) // Yellow for in progress
+                      : context.themeSoftRow.withOpacity(0.5); // Gray for empty
+              
+              final borderColor = isCompleted
+                  ? context.themeAccent
+                  : isFilled
+                      ? Colors.orange
+                      : context.themeTextMuted.withOpacity(0.2);
+              
+              return Expanded(
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.0, end: 1.0),
+                  duration: Duration(milliseconds: 300 + (index * 50)),
+                  curve: Curves.easeOut,
+                  builder: (context, value, child) {
+                    return Transform.scale(
+                      scale: 0.8 + (value * 0.2),
+                      child: Opacity(
+                        opacity: value,
+                        child: Container(
+                          margin: EdgeInsets.only(right: index < 4 ? 8 : 0),
+                          height: 48,
+                          decoration: BoxDecoration(
+                            color: slotColor,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: borderColor,
+                              width: isCompleted ? 2.0 : 1.5,
+                            ),
+                            boxShadow: isCompleted
+                                ? [
+                                    BoxShadow(
+                                      color: context.themeAccent.withOpacity(0.3),
+                                      blurRadius: 8,
+                                      spreadRadius: 0,
+                                    ),
+                                  ]
+                                : null,
+                          ),
+                          child: Center(
+                            child: isCompleted
+                                ? TweenAnimationBuilder<double>(
+                                    tween: Tween(begin: 0.0, end: 1.0),
+                                    duration: const Duration(milliseconds: 400),
+                                    curve: Curves.elasticOut,
+                                    builder: (context, scale, _) {
+                                      return Transform.scale(
+                                        scale: scale,
+                                        child: Icon(
+                                          Icons.check_circle,
+                                          color: context.themeAccent,
+                                          size: 24,
+                                        ),
+                                      );
+                                    },
+                                  )
+                                : isFilled
+                                    ? Icon(
+                                        Icons.radio_button_unchecked,
+                                        color: Colors.orange,
+                                        size: 20,
+                                      )
+                                    : Icon(
+                                        Icons.add_circle_outline,
+                                        color: context.themeTextMuted.withOpacity(0.4),
+                                        size: 20,
+                                      ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              );
+            }),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SprintStat extends StatelessWidget {
+  final String label;
+  final String value;
+  final int total;
+
+  const _SprintStat({
+    required this.label,
+    required this.value,
+    required this.total,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: AppTypography.xs,
+            color: context.themeTextMuted,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '$value/$total',
+          style: const TextStyle(
+            fontSize: AppTypography.xl,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
     );
   }
 }
@@ -2627,6 +4559,78 @@ class _MiniStat extends StatelessWidget {
   }
 }
 
+class _DailyFocusSlots extends StatelessWidget {
+  final int doingCount;
+
+  const _DailyFocusSlots({required this.doingCount});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: context.themeCard,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.today, size: 16, color: context.themeTextMuted),
+          const SizedBox(width: 8),
+          Text(
+            "Today's Focus:",
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: context.themeTextMuted,
+            ),
+          ),
+          const Spacer(),
+          Row(
+            children: List.generate(3, (index) {
+              final isFilled = index < doingCount;
+              return Container(
+                margin: EdgeInsets.only(left: index > 0 ? 6 : 0),
+                width: 24,
+                height: 24,
+                decoration: BoxDecoration(
+                  color: isFilled
+                      ? context.themeAccent
+                      : context.themeSoftRow,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: isFilled
+                        ? context.themeAccent
+                        : context.themeTextMuted.withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: isFilled
+                    ? Icon(
+                        Icons.check,
+                        size: 14,
+                        color: Colors.white,
+                      )
+                    : null,
+              );
+            }),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            '$doingCount/3',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: doingCount >= 3
+                  ? Colors.orange
+                  : context.themeTextMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _FocusPills extends StatelessWidget {
   final Focus selected;
   final ValueChanged<Focus> onSelect;
@@ -2660,6 +4664,173 @@ backgroundColor: context.themeCard,
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+}
+
+class _PomodoroSettingsCard extends StatefulWidget {
+  final int workMinutes;
+  final int breakMinutes;
+  final Future<void> Function(int work, int break_) onSettingsChanged;
+
+  const _PomodoroSettingsCard({
+    required this.workMinutes,
+    required this.breakMinutes,
+    required this.onSettingsChanged,
+  });
+
+  @override
+  State<_PomodoroSettingsCard> createState() => _PomodoroSettingsCardState();
+}
+
+class _PomodoroSettingsCardState extends State<_PomodoroSettingsCard> {
+  late int _workMinutes;
+  late int _breakMinutes;
+
+  @override
+  void initState() {
+    super.initState();
+    _workMinutes = widget.workMinutes;
+    _breakMinutes = widget.breakMinutes;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _SectionCard(
+      title: 'Pomodoro Settings',
+      count: 0,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Preset options
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _PomodoroPreset(
+                label: 'Classic',
+                work: 25,
+                break_: 5,
+                selected: _workMinutes == 25 && _breakMinutes == 5,
+                onSelect: () => _updateSettings(25, 5),
+              ),
+              _PomodoroPreset(
+                label: 'Extended',
+                work: 45,
+                break_: 15,
+                selected: _workMinutes == 45 && _breakMinutes == 15,
+                onSelect: () => _updateSettings(45, 15),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          // Custom sliders
+          Text(
+            'Custom',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: context.themeTextMuted,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Focus: $_workMinutes min',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                    Slider(
+                      value: _workMinutes.toDouble(),
+                      min: 15,
+                      max: 60,
+                      divisions: 9,
+                      label: '$_workMinutes min',
+                      onChanged: (value) {
+                        setState(() {
+                          _workMinutes = value.round();
+                        });
+                        _updateSettings(_workMinutes, _breakMinutes);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Rest: $_breakMinutes min',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                    Slider(
+                      value: _breakMinutes.toDouble(),
+                      min: 3,
+                      max: 30,
+                      divisions: 9,
+                      label: '$_breakMinutes min',
+                      onChanged: (value) {
+                        setState(() {
+                          _breakMinutes = value.round();
+                        });
+                        _updateSettings(_workMinutes, _breakMinutes);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _updateSettings(int work, int break_) {
+    setState(() {
+      _workMinutes = work;
+      _breakMinutes = break_;
+    });
+    widget.onSettingsChanged(work, break_);
+  }
+}
+
+class _PomodoroPreset extends StatelessWidget {
+  final String label;
+  final int work;
+  final int break_;
+  final bool selected;
+  final VoidCallback onSelect;
+
+  const _PomodoroPreset({
+    required this.label,
+    required this.work,
+    required this.break_,
+    required this.selected,
+    required this.onSelect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ChoiceChip(
+      selected: selected,
+      label: Text('$label ($work/$break_)'),
+      onSelected: (_) => onSelect(),
+      selectedColor: context.themeAccent,
+      backgroundColor: context.themeCard,
+      labelStyle: TextStyle(
+        color: selected ? Colors.white : null,
+        fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
       ),
     );
   }
@@ -2842,6 +5013,122 @@ class _TodaySkeleton extends StatelessWidget {
   }
 }
 
+class _SprintHistorySection extends StatelessWidget {
+  const _SprintHistorySection();
+
+  @override
+  Widget build(BuildContext context) {
+    final sprintHistory = Storage.loadSprintHistory();
+    final activeSprint = Storage.loadActiveSprint();
+    
+    final allSprints = [
+      activeSprint,
+      ...sprintHistory,
+    ];
+
+    return _SectionCard(
+      title: 'Sprint History',
+      count: allSprints.length,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ...allSprints.take(5).map((sprint) {
+            final isActive = sprint == activeSprint;
+            // Sprint'in tasklarını yüklemek için tüm taskları al
+            final allTasks = Storage.loadActiveTasks();
+            final completed = sprint.completedCount(allTasks);
+            final total = sprint.totalCount();
+            final percentage = sprint.completionPercentage(allTasks);
+
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: isActive 
+                      ? context.themeAccent.withOpacity(0.1)
+                      : context.themeSoftRow,
+                  borderRadius: BorderRadius.circular(12),
+                  border: isActive
+                      ? Border.all(color: context.themeAccent, width: 1)
+                      : null,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            sprint.name,
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              color: isActive ? context.themeAccent : null,
+                            ),
+                          ),
+                        ),
+                        if (isActive)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: context.themeAccent,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Text(
+                              'Active',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '$completed/$total completed',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: context.themeTextMuted,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '${percentage.toStringAsFixed(0)}%',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: context.themeAccent,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+          if (allSprints.length > 5)
+            Text(
+              '${allSprints.length - 5} more sprints...',
+              style: TextStyle(
+                fontSize: 12,
+                color: context.themeTextMuted,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class _HistorySkeleton extends StatelessWidget {
   const _HistorySkeleton();
 
@@ -2938,6 +5225,8 @@ class _TaskList extends StatelessWidget {
   final void Function(Task) onTapTask;
   final void Function(Task) onDeleteTask;
   final void Function(Task) onToggleCommit;
+  final void Function(Task)? onDuplicateTask;
+  final void Function(Task)? onAddToSprint;
 
   final bool dimmed;
 
@@ -2949,10 +5238,106 @@ class _TaskList extends StatelessWidget {
   required this.onTapTask,
   required this.onDeleteTask,
   required this.onToggleCommit,
+  this.onDuplicateTask,
+  this.onAddToSprint,
   this.dimmed = false,
   this.disableSwipeForward = false,
 });
 
+  Widget _buildTaskSubtitle(BuildContext context, Task t) {
+    final parts = <Widget>[];
+    
+    // Rolled over info
+    if (t.rolledOver && t.carriedOverFromDay != null) {
+      parts.add(
+        Text(
+          'Rolled from ${t.carriedOverFromDay}',
+          style: TextStyle(color: context.themeTextMuted, fontSize: 12),
+        ),
+      );
+    }
+    
+    // Due date
+    if (t.dueDate != null) {
+      final now = DateTime.now();
+      final due = t.dueDate!;
+      final isOverdue = due.isBefore(now) && t.status != TaskStatus.done;
+      final isToday = due.year == now.year && due.month == now.month && due.day == now.day;
+      final isTomorrow = due.year == now.year && due.month == now.month && due.day == now.day + 1;
+      
+      String dueText;
+      if (isToday) {
+        dueText = 'Due today ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      } else if (isTomorrow) {
+        dueText = 'Due tomorrow ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      } else {
+        dueText = 'Due ${due.day}/${due.month}/${due.year} ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      }
+      
+      parts.add(
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isOverdue ? Icons.warning : Icons.schedule,
+              size: 12,
+              color: isOverdue ? context.themeError : context.themeTextMuted,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              dueText,
+              style: TextStyle(
+                color: isOverdue ? context.themeError : context.themeTextMuted,
+                fontSize: 12,
+                fontWeight: isOverdue ? FontWeight.w600 : FontWeight.normal,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    
+    // Tags
+    if (t.tags.isNotEmpty) {
+      parts.add(
+        Wrap(
+          spacing: 4,
+          runSpacing: 4,
+          children: t.tags.take(3).map((tag) {
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: context.themeAccent.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: context.themeAccent.withOpacity(0.3),
+                  width: 1,
+                ),
+              ),
+              child: Text(
+                '#$tag',
+                style: TextStyle(
+                  color: context.themeAccent,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      );
+    }
+    
+    if (parts.isEmpty) return const SizedBox.shrink();
+    
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: parts,
+      ),
+    );
+  }
 
   @override
 Widget build(BuildContext context) {
@@ -3098,22 +5483,47 @@ Widget build(BuildContext context) {
                     ),
                 ],
               ),
-                      subtitle: (t.rolledOver &&
-                              t.carriedOverFromDay != null)
-                  ? Text(
-                      'Rolled from ${t.carriedOverFromDay}',
-                              style: TextStyle(
-                                color: context.themeTextMuted,
-                              ),
-                    )
-                  : null,
+                      subtitle: _buildTaskSubtitle(context, t),
               trailing: PopupMenuButton<String>(
                 icon: const Icon(Icons.more_horiz_rounded),
                 onSelected: (v) {
-                  if (v == 'delete') onDeleteTask(t);
-                  if (v == 'commit') onToggleCommit(t);
+                  if (v == 'add_to_sprint' && onAddToSprint != null) {
+                    onAddToSprint!(t);
+                  } else if (v == 'duplicate' && onDuplicateTask != null) {
+                    onDuplicateTask!(t);
+                  } else if (v == 'delete') {
+                    onDeleteTask(t);
+                  } else if (v == 'commit') {
+                    onToggleCommit(t);
+                  }
                 },
                 itemBuilder: (ctx) => [
+                  if (onAddToSprint != null)
+                    PopupMenuItem(
+                      value: 'add_to_sprint',
+                      child: Row(
+                        children: [
+                          const Icon(Icons.add_task, size: 18),
+                          const SizedBox(width: 8),
+                          const Text('Add to Sprint'),
+                        ],
+                      ),
+                    ),
+                  if (onAddToSprint != null)
+                    const PopupMenuDivider(),
+                  if (onDuplicateTask != null)
+                    PopupMenuItem(
+                      value: 'duplicate',
+                      child: Row(
+                        children: [
+                          const Icon(Icons.copy, size: 18),
+                          const SizedBox(width: 8),
+                          const Text('Duplicate'),
+                        ],
+                      ),
+                    ),
+                  if (onDuplicateTask != null && showCommit)
+                    const PopupMenuDivider(),
                   if (showCommit)
                     PopupMenuItem(
                       value: 'commit',
@@ -3123,9 +5533,16 @@ Widget build(BuildContext context) {
                                     : 'Commit',
                               ),
                     ),
-                  const PopupMenuItem(
+                  const PopupMenuDivider(),
+                  PopupMenuItem(
                     value: 'delete',
-                    child: Text('Delete'),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                        const SizedBox(width: 8),
+                        Text('Delete', style: TextStyle(color: context.themeError)),
+                      ],
+                    ),
                   ),
                 ],
                       ),
@@ -3146,6 +5563,98 @@ class _ReadOnlyTaskList extends StatelessWidget {
   final bool dimmed;
 
   const _ReadOnlyTaskList({required this.tasks, this.dimmed = false});
+
+  Widget _buildReadOnlyTaskSubtitle(BuildContext context, Task t) {
+    final parts = <Widget>[];
+    
+    if (t.rolledOver && t.carriedOverFromDay != null) {
+      parts.add(
+        Text(
+          'Rolled from ${t.carriedOverFromDay}',
+          style: TextStyle(color: context.themeTextMuted, fontSize: 12),
+        ),
+      );
+    }
+    
+    if (t.dueDate != null) {
+      final now = DateTime.now();
+      final due = t.dueDate!;
+      final isOverdue = due.isBefore(now) && t.status != TaskStatus.done;
+      final isToday = due.year == now.year && due.month == now.month && due.day == now.day;
+      final isTomorrow = due.year == now.year && due.month == now.month && due.day == now.day + 1;
+      
+      String dueText;
+      if (isToday) {
+        dueText = 'Due today ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      } else if (isTomorrow) {
+        dueText = 'Due tomorrow ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      } else {
+        dueText = 'Due ${due.day}/${due.month}/${due.year} ${due.hour.toString().padLeft(2, '0')}:${due.minute.toString().padLeft(2, '0')}';
+      }
+      
+      parts.add(
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isOverdue ? Icons.warning : Icons.schedule,
+              size: 12,
+              color: isOverdue ? context.themeError : context.themeTextMuted,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              dueText,
+              style: TextStyle(
+                color: isOverdue ? context.themeError : context.themeTextMuted,
+                fontSize: 12,
+                fontWeight: isOverdue ? FontWeight.w600 : FontWeight.normal,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    
+    if (t.tags.isNotEmpty) {
+      parts.add(
+        Wrap(
+          spacing: 4,
+          runSpacing: 4,
+          children: t.tags.take(3).map((tag) {
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: context.themeAccent.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: context.themeAccent.withOpacity(0.3),
+                  width: 1,
+                ),
+              ),
+              child: Text(
+                '#$tag',
+                style: TextStyle(
+                  color: context.themeAccent,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      );
+    }
+    
+    if (parts.isEmpty) return const SizedBox.shrink();
+    
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: parts,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3207,12 +5716,7 @@ child: ListTile(
                     ),
                 ],
               ),
-              subtitle: (t.rolledOver && t.carriedOverFromDay != null)
-                  ? Text(
-                      'Rolled from ${t.carriedOverFromDay}',
-                      style: TextStyle(color: context.themeTextMuted),
-                    )
-                  : null,
+              subtitle: _buildReadOnlyTaskSubtitle(context, t),
             ),
           ),
         );
@@ -3350,40 +5854,156 @@ class AppTypography {
   static const double xxxl = 32.0;
 }
 
-// Light mode colors - Improved contrast and vibrancy
-const Color kAccent = Color(0xFF7C7EF2); // Slightly more vibrant lilac
-const Color kBg = Color(0xFFF1F3F5); // Slightly darker for better contrast
-const Color kCard = Colors.white;
-const Color kSoftRow = Color(0xFFF0F2F5); // More contrast from bg
-const Color kSoftRowDim = Color(0xFFE8EAED); // Even more contrast
-const Color kTextMuted = Color(0xFF64748B); // Better readability
+// ===================== Theme System =====================
 
-// Semantic colors
-const Color kSuccess = Color(0xFF10B981); // Green
-const Color kWarning = Color(0xFFF59E0B); // Amber
-const Color kError = Color(0xFFEF4444); // Red
-const Color kInfo = Color(0xFF3B82F6); // Blue
+// Theme color palettes
+class ThemePalette {
+  final Color accent;
+  final Color bg;
+  final Color card;
+  final Color softRow;
+  final Color softRowDim;
+  final Color textMuted;
 
-ThemeData buildCalmTheme() {
-  return ThemeData(
-    useMaterial3: true,
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: kAccent,
-      brightness: Brightness.light,
-    ),
-    scaffoldBackgroundColor: kBg,
-  );
+  const ThemePalette({
+    required this.accent,
+    required this.bg,
+    required this.card,
+    required this.softRow,
+    required this.softRowDim,
+    required this.textMuted,
+  });
 }
 
-// Dark mode colors - Improved depth and contrast
-const Color kAccentDark = Color(0xFF8B8CF6); // Slightly brighter
-const Color kBgDark = Color(0xFF0F172A); // Slightly darker base
-const Color kCardDark = Color(0xFF1E293B); // More contrast from bg
-const Color kSoftRowDark = Color(0xFF334155); // Better separation from card
-const Color kSoftRowDimDark = Color(0xFF475569); // Even more contrast
-const Color kTextMutedDark = Color(0xFF94A3B8); // Better readability
+// Theme definitions
+class AppThemes {
+  // Calm (Default) - Lilac
+  static const ThemePalette calmLight = ThemePalette(
+    accent: Color(0xFF7C7EF2),
+    bg: Color(0xFFF1F3F5),
+    card: Colors.white,
+    softRow: Color(0xFFF0F2F5),
+    softRowDim: Color(0xFFE8EAED),
+    textMuted: Color(0xFF64748B),
+  );
+  static const ThemePalette calmDark = ThemePalette(
+    accent: Color(0xFF8B8CF6),
+    bg: Color(0xFF0F172A),
+    card: Color(0xFF1E293B),
+    softRow: Color(0xFF334155),
+    softRowDim: Color(0xFF475569),
+    textMuted: Color(0xFF94A3B8),
+  );
 
-// Dark mode semantic colors (slightly adjusted for dark theme)
+  // Ocean - Blue/Teal
+  static const ThemePalette oceanLight = ThemePalette(
+    accent: Color(0xFF06B6D4),
+    bg: Color(0xFFF0F9FF),
+    card: Colors.white,
+    softRow: Color(0xFFE0F2FE),
+    softRowDim: Color(0xFFBAE6FD),
+    textMuted: Color(0xFF475569),
+  );
+  static const ThemePalette oceanDark = ThemePalette(
+    accent: Color(0xFF22D3EE),
+    bg: Color(0xFF0C1E2A),
+    card: Color(0xFF1E3A4A),
+    softRow: Color(0xFF2D4A5A),
+    softRowDim: Color(0xFF3D5A6A),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Forest - Green
+  static const ThemePalette forestLight = ThemePalette(
+    accent: Color(0xFF10B981),
+    bg: Color(0xFFF0FDF4),
+    card: Colors.white,
+    softRow: Color(0xFFDCFCE7),
+    softRowDim: Color(0xFFBBF7D0),
+    textMuted: Color(0xFF475569),
+  );
+  static const ThemePalette forestDark = ThemePalette(
+    accent: Color(0xFF34D399),
+    bg: Color(0xFF0F1F15),
+    card: Color(0xFF1E3A2A),
+    softRow: Color(0xFF2D4A3A),
+    softRowDim: Color(0xFF3D5A4A),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Sunset - Orange/Pink
+  static const ThemePalette sunsetLight = ThemePalette(
+    accent: Color(0xFFF97316),
+    bg: Color(0xFFFFF7ED),
+    card: Colors.white,
+    softRow: Color(0xFFFFEDD5),
+    softRowDim: Color(0xFFFFD7B5),
+    textMuted: Color(0xFF64748B),
+  );
+  static const ThemePalette sunsetDark = ThemePalette(
+    accent: Color(0xFFFB923C),
+    bg: Color(0xFF1F0F0A),
+    card: Color(0xFF3A1F15),
+    softRow: Color(0xFF4A2F25),
+    softRowDim: Color(0xFF5A3F35),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Dark Professional - Monochrome
+  static const ThemePalette darkProfessionalLight = ThemePalette(
+    accent: Color(0xFF6366F1),
+    bg: Color(0xFFFAFAFA),
+    card: Colors.white,
+    softRow: Color(0xFFF5F5F5),
+    softRowDim: Color(0xFFE5E5E5),
+    textMuted: Color(0xFF6B7280),
+  );
+  static const ThemePalette darkProfessionalDark = ThemePalette(
+    accent: Color(0xFF818CF8),
+    bg: Color(0xFF0A0A0A),
+    card: Color(0xFF1A1A1A),
+    softRow: Color(0xFF2A2A2A),
+    softRowDim: Color(0xFF3A3A3A),
+    textMuted: Color(0xFF9CA3AF),
+  );
+
+  static ThemePalette getPalette(AppTheme theme, bool isDark) {
+    switch (theme) {
+      case AppTheme.calm:
+        return isDark ? calmDark : calmLight;
+      case AppTheme.ocean:
+        return isDark ? oceanDark : oceanLight;
+      case AppTheme.forest:
+        return isDark ? forestDark : forestLight;
+      case AppTheme.sunset:
+        return isDark ? sunsetDark : sunsetLight;
+      case AppTheme.darkProfessional:
+        return isDark ? darkProfessionalDark : darkProfessionalLight;
+    }
+  }
+
+  static String getDisplayName(AppTheme theme) {
+    switch (theme) {
+      case AppTheme.calm:
+        return 'Calm';
+      case AppTheme.ocean:
+        return 'Ocean';
+      case AppTheme.forest:
+        return 'Forest';
+      case AppTheme.sunset:
+        return 'Sunset';
+      case AppTheme.darkProfessional:
+        return 'Dark Professional';
+    }
+  }
+}
+
+// Semantic colors (same for all themes)
+const Color kSuccess = Color(0xFF10B981);
+const Color kWarning = Color(0xFFF59E0B);
+const Color kError = Color(0xFFEF4444);
+const Color kInfo = Color(0xFF3B82F6);
+
 const Color kSuccessDark = Color(0xFF34D399);
 const Color kWarningDark = Color(0xFFFBBF24);
 const Color kErrorDark = Color(0xFFF87171);
@@ -3391,12 +6011,19 @@ const Color kInfoDark = Color(0xFF60A5FA);
 
 // Helper extension to get theme-aware colors
 extension ThemeColors on BuildContext {
-  Color get themeBg => Theme.of(this).brightness == Brightness.dark ? kBgDark : kBg;
-  Color get themeCard => Theme.of(this).brightness == Brightness.dark ? kCardDark : kCard;
-  Color get themeSoftRow => Theme.of(this).brightness == Brightness.dark ? kSoftRowDark : kSoftRow;
-  Color get themeSoftRowDim => Theme.of(this).brightness == Brightness.dark ? kSoftRowDimDark : kSoftRowDim;
-  Color get themeTextMuted => Theme.of(this).brightness == Brightness.dark ? kTextMutedDark : kTextMuted;
-  Color get themeAccent => Theme.of(this).brightness == Brightness.dark ? kAccentDark : kAccent;
+  ThemePalette get _palette {
+    final premium = Provider.of<PremiumController>(this, listen: false);
+    final appTheme = premium.isPremium ? Storage.loadTheme() : AppTheme.calm;
+    final isDark = Theme.of(this).brightness == Brightness.dark;
+    return AppThemes.getPalette(appTheme, isDark);
+  }
+
+  Color get themeBg => _palette.bg;
+  Color get themeCard => _palette.card;
+  Color get themeSoftRow => _palette.softRow;
+  Color get themeSoftRowDim => _palette.softRowDim;
+  Color get themeTextMuted => _palette.textMuted;
+  Color get themeAccent => _palette.accent;
   
   // Semantic colors
   Color get themeSuccess => Theme.of(this).brightness == Brightness.dark ? kSuccessDark : kSuccess;
@@ -3405,16 +6032,21 @@ extension ThemeColors on BuildContext {
   Color get themeInfo => Theme.of(this).brightness == Brightness.dark ? kInfoDark : kInfo;
 }
 
-ThemeData buildCalmDarkTheme() {
+ThemeData buildTheme(AppTheme theme, bool isDark) {
+  final palette = AppThemes.getPalette(theme, isDark);
   return ThemeData(
     useMaterial3: true,
     colorScheme: ColorScheme.fromSeed(
-      seedColor: kAccentDark,
-      brightness: Brightness.dark,
+      seedColor: palette.accent,
+      brightness: isDark ? Brightness.dark : Brightness.light,
     ),
-    scaffoldBackgroundColor: kBgDark,
+    scaffoldBackgroundColor: palette.bg,
   );
 }
+
+// Legacy functions for backward compatibility
+ThemeData buildCalmTheme() => buildTheme(AppTheme.calm, false);
+ThemeData buildCalmDarkTheme() => buildTheme(AppTheme.calm, true);
 
 class TopIconButton extends StatelessWidget {
   final IconData icon;
@@ -3475,10 +6107,105 @@ class _SettingsSheet extends StatelessWidget {
   }
 }
 
+class _SprintSlotPreview extends StatelessWidget {
+  final int effectiveSprintCount;
+  final bool isCoreComplete;
+
+  const _SprintSlotPreview({
+    required this.effectiveSprintCount,
+    this.isCoreComplete = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final total = effectiveSprintCount;
+    final nextSlot = total + 1;
+    final remaining = 5 - total;
+
+    // Core 5 tamamlandıysa stretch modu - ekleme izinli
+    if (total >= 5 && !isCoreComplete) {
+      return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.red.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.red.withOpacity(0.3)),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.warning, color: Colors.red, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Sprint is full (5/5). Finish a task first.',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.red,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: context.themeSoftRow,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.info_outline, size: 16, color: context.themeTextMuted),
+              const SizedBox(width: 6),
+              Text(
+                isCoreComplete
+                    ? 'This will be a stretch commitment.'
+                    : 'This will fill slot $nextSlot/5',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: context.themeTextMuted,
+                ),
+              ),
+            ],
+          ),
+          if (remaining == 1) ...[
+            const SizedBox(height: 8),
+            Text(
+              '⚠️ Last slot remaining',
+              style: TextStyle(
+                fontSize: 11,
+                color: Colors.orange,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _AddTaskSheet extends StatefulWidget {
   final void Function(String) onAdd;
+  final FlowMode mode;
+  final int currentTaskCount;
+  final int effectiveSprintCount;
+  final bool isCoreComplete;
 
-  const _AddTaskSheet({required this.onAdd});
+  const _AddTaskSheet({
+    required this.onAdd,
+    required this.mode,
+    required this.currentTaskCount,
+    required this.effectiveSprintCount,
+    this.isCoreComplete = false,
+  });
 
   @override
   State<_AddTaskSheet> createState() => _AddTaskSheetState();
@@ -3545,6 +6272,14 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
               ),
             ],
           ),
+          // Sprint slot preview (Scrum mode için)
+          if (widget.mode == FlowMode.scrum) ...[
+            const SizedBox(height: 12),
+            _SprintSlotPreview(
+              effectiveSprintCount: widget.effectiveSprintCount,
+              isCoreComplete: widget.isCoreComplete,
+            ),
+          ],
           const SizedBox(height: 12),
           SizedBox(
             height: 36,
@@ -3571,7 +6306,7 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
 
 class _EditTaskSheet extends StatefulWidget {
   final Task task;
-  final void Function(String, Focus) onSave;
+  final void Function(String, Focus, List<String>, DateTime?) onSave;
 
   const _EditTaskSheet({
     required this.task,
@@ -3584,19 +6319,70 @@ class _EditTaskSheet extends StatefulWidget {
 
 class _EditTaskSheetState extends State<_EditTaskSheet> {
   late final TextEditingController _titleController;
+  late final TextEditingController _tagsController;
   late Focus _selectedFocus;
+  late List<String> _tags;
+  DateTime? _dueDate;
 
   @override
   void initState() {
     super.initState();
     _titleController = TextEditingController(text: widget.task.title);
+    _tagsController = TextEditingController(text: widget.task.tags.join(', '));
     _selectedFocus = widget.task.focus;
+    _tags = List.from(widget.task.tags);
+    _dueDate = widget.task.dueDate;
   }
 
   @override
   void dispose() {
     _titleController.dispose();
+    _tagsController.dispose();
     super.dispose();
+  }
+
+  void _parseTags() {
+    final tagsText = _tagsController.text.trim();
+    if (tagsText.isEmpty) {
+      _tags = [];
+    } else {
+      _tags = tagsText.split(',').map((t) => t.trim()).where((t) => t.isNotEmpty).toList();
+    }
+  }
+
+  Future<void> _selectDueDate() async {
+    final now = DateTime.now();
+    final firstDate = now.subtract(const Duration(days: 365));
+    final lastDate = now.add(const Duration(days: 365));
+    
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _dueDate ?? now,
+      firstDate: firstDate,
+      lastDate: lastDate,
+    );
+    
+    if (picked != null) {
+      final time = _dueDate != null 
+          ? TimeOfDay.fromDateTime(_dueDate!)
+          : const TimeOfDay(hour: 23, minute: 59);
+      final timePicked = await showTimePicker(
+        context: context,
+        initialTime: time,
+      );
+      
+      if (timePicked != null) {
+        setState(() {
+          _dueDate = DateTime(
+            picked.year,
+            picked.month,
+            picked.day,
+            timePicked.hour,
+            timePicked.minute,
+          );
+        });
+      }
+    }
   }
 
   @override
@@ -3608,49 +6394,93 @@ class _EditTaskSheetState extends State<_EditTaskSheet> {
         top: 10,
         bottom: 16 + MediaQuery.of(context).viewInsets.bottom,
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Edit task',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _titleController,
-            decoration: const InputDecoration(labelText: 'Title'),
-          ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 10,
-            children: Focus.values.map((f) {
-              final on = f == _selectedFocus;
-              return ChoiceChip(
-                selected: on,
-                label: Text(titleCase(f.name)),
-                onSelected: (_) {
-                  setState(() {
-                    _selectedFocus = f;
-                  });
-                },
-              );
-            }).toList(),
-          ),
-          const SizedBox(height: 14),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton(
-                  onPressed: () {
-                    final newTitle = _titleController.text.trim();
-                    if (newTitle.isEmpty) return;
-                    widget.onSave(newTitle, _selectedFocus);
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Edit task',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _titleController,
+              decoration: const InputDecoration(labelText: 'Title'),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              children: Focus.values.map((f) {
+                final on = f == _selectedFocus;
+                return ChoiceChip(
+                  selected: on,
+                  label: Text(titleCase(f.name)),
+                  onSelected: (_) {
+                    setState(() {
+                      _selectedFocus = f;
+                    });
                   },
-                  child: const Text('Save'),
-                ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _tagsController,
+              decoration: const InputDecoration(
+                labelText: 'Tags (comma separated)',
+                hintText: 'e.g. urgent, meeting, project',
+                helperText: 'Separate tags with commas',
               ),
-            ],
-          ),
-        ],
+              onChanged: (_) => _parseTags(),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _selectDueDate,
+                    icon: Icon(
+                      _dueDate != null ? Icons.event : Icons.event_outlined,
+                      size: 18,
+                    ),
+                    label: Text(
+                      _dueDate != null
+                          ? 'Due: ${_dueDate!.day}/${_dueDate!.month}/${_dueDate!.year} ${_dueDate!.hour.toString().padLeft(2, '0')}:${_dueDate!.minute.toString().padLeft(2, '0')}'
+                          : 'Set due date',
+                    ),
+                  ),
+                ),
+                if (_dueDate != null) ...[
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.clear),
+                    onPressed: () {
+                      setState(() {
+                        _dueDate = null;
+                      });
+                    },
+                    tooltip: 'Clear due date',
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton(
+                    onPressed: () {
+                      final newTitle = _titleController.text.trim();
+                      if (newTitle.isEmpty) return;
+                      _parseTags();
+                      widget.onSave(newTitle, _selectedFocus, _tags, _dueDate);
+                    },
+                    child: const Text('Save'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -4164,24 +6994,19 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   final List<_OnboardingPage> _pages = [
     _OnboardingPage(
-      icon: Icons.today,
-      title: 'Welcome to Leanly',
-      description: 'Your agile task management companion. Organize your day with Scrum, Kanban, or XP methodologies.',
+      icon: Icons.calendar_view_week,
+      title: 'Your week is one sprint.',
+      description: '',
     ),
     _OnboardingPage(
-      icon: Icons.swipe,
-      title: 'Swipe to Move Tasks',
-      description: 'Swipe right to move tasks forward (To do → Doing → Done). Swipe left to move them back.',
+      icon: Icons.format_list_numbered,
+      title: 'You can only choose 5 commitments.',
+      description: '',
     ),
     _OnboardingPage(
-      icon: Icons.timer,
-      title: 'Deep Focus Mode',
-      description: 'Use the 🍅 button to start Pomodoro sessions. Track your focused work time throughout the day.',
-    ),
-    _OnboardingPage(
-      icon: Icons.nightlight_round,
-      title: 'End Your Day',
-      description: 'Close your day with a mood check. Unfinished tasks will roll over to tomorrow automatically.',
+      icon: Icons.center_focus_strong,
+      title: 'Each day, focus on up to 3.',
+      description: '',
     ),
   ];
 
@@ -4239,16 +7064,18 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                           ),
                           textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 16),
-                        Text(
-                          page.description,
-                          style: TextStyle(
-                            fontSize: 16,
-                            color: context.themeTextMuted,
-                            height: 1.5,
+                        if (page.description.isNotEmpty) ...[
+                          const SizedBox(height: 16),
+                          Text(
+                            page.description,
+                            style: TextStyle(
+                              fontSize: 16,
+                              color: context.themeTextMuted,
+                              height: 1.5,
+                            ),
+                            textAlign: TextAlign.center,
                           ),
-                          textAlign: TextAlign.center,
-                        ),
+                        ],
                       ],
                     ),
                   );
@@ -4284,8 +7111,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     ),
                     child: Text(
                       _currentPage == _pages.length - 1
-                          ? 'Get Started'
-                          : 'Next',
+                          ? 'Start my sprint'
+                          : 'Continue',
                     ),
                   ),
                 ],
@@ -4308,6 +7135,288 @@ class _OnboardingPage {
     required this.title,
     required this.description,
   });
+}
+
+// ===================== Account Section =====================
+
+class _AccountSection extends StatefulWidget {
+  final VoidCallback? onSyncComplete;
+
+  const _AccountSection({this.onSyncComplete});
+
+  @override
+  State<_AccountSection> createState() => _AccountSectionState();
+}
+
+class _AccountSectionState extends State<_AccountSection> {
+  bool _isLoading = false;
+  String? _error;
+
+  bool get _isSignedIn => SupabaseService.isAuthenticated;
+
+  Future<void> _signIn() async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final success = await AuthService.signInWithApple();
+      if (success && mounted) {
+        // Sync data after sign in
+        await _syncAllData();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Signed in successfully! Data synced.'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      } else if (mounted) {
+        setState(() {
+          _error = 'Sign in failed. Please try again.';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = 'Sign in error: $e';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _syncAllData() async {
+    // Sync premium status
+    final premium = Provider.of<PremiumController>(context, listen: false);
+    await premium.syncPremiumFromRemote();
+
+    // Sync tasks (this will pull from remote or push local if remote is empty)
+    await Storage.syncTasksFromRemote();
+
+    widget.onSyncComplete?.call();
+  }
+
+  Future<void> _signOut() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sign Out'),
+        content: const Text(
+          'Your data will remain on this device but won\'t sync across devices until you sign in again.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Sign Out'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await AuthService.signOut();
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Signed out'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isSignedIn) {
+      final user = AuthService.currentUser;
+      final email = user?.email ?? 'Apple Account';
+
+      return _SectionCard(
+        title: 'Account',
+        count: 0,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: context.themeAccent.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Icon(
+                    Icons.person,
+                    color: context.themeAccent,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        email,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.cloud_done,
+                            size: 14,
+                            color: context.themeAccent,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Synced across devices',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: context.themeTextMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _isLoading
+                        ? null
+                        : () async {
+                            setState(() => _isLoading = true);
+                            await _syncAllData();
+                            if (mounted) {
+                              setState(() => _isLoading = false);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Data synced!'),
+                                  behavior: SnackBarBehavior.floating,
+                                ),
+                              );
+                            }
+                          },
+                    icon: _isLoading
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.sync, size: 18),
+                    label: const Text('Sync Now'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: _signOut,
+                  child: Text(
+                    'Sign Out',
+                    style: TextStyle(color: context.themeTextMuted),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Not signed in
+    return _SectionCard(
+      title: 'Account',
+      count: 0,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.devices, size: 20, color: context.themeAccent),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Sync across devices',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Sign in to sync your tasks, premium status, and history across iPhone and iPad.',
+            style: TextStyle(
+              fontSize: 13,
+              color: context.themeTextMuted,
+            ),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.red,
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _isLoading ? null : _signIn,
+              icon: _isLoading
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.apple, size: 20),
+              label: Text(_isLoading ? 'Signing in...' : 'Sign in with Apple'),
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).brightness == Brightness.dark
+                    ? Colors.white
+                    : Colors.black,
+                foregroundColor: Theme.of(context).brightness == Brightness.dark
+                    ? Colors.black
+                    : Colors.white,
+                minimumSize: const Size(double.infinity, 48),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 // ===================== END UI PATCH =====================
