@@ -627,6 +627,20 @@ class Storage {
     await box.put(settingsKey, map);
   }
 
+  static String? loadLastActiveDateKey() {
+    final raw = box.get(settingsKey);
+    if (raw is Map) return raw['lastActiveDateKey'] as String?;
+    return null;
+  }
+
+  static Future<void> saveLastActiveDateKey(String dayKey) async {
+    final existing = box.get(settingsKey);
+    final map = <String, dynamic>{};
+    if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
+    map['lastActiveDateKey'] = dayKey;
+    await box.put(settingsKey, map);
+  }
+
   /// Save day log to both local cache and remote (if authenticated)
   static Future<void> saveDayLog(DayLog log) async {
     // Always save to local cache first
@@ -1440,6 +1454,23 @@ class _TodayScreenState extends State<TodayScreen> {
 
     _loadActive();
     _scheduleDailyEndDayNotification();
+    _startMidnightCheckTimer();
+  }
+
+  Timer? _midnightCheckTimer;
+
+  void _startMidnightCheckTimer() {
+    _midnightCheckTimer?.cancel();
+    _midnightCheckTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
+      if (!mounted) return;
+      final nowKey = _dateKey(DateTime.now());
+      final lastActive = Storage.loadLastActiveDateKey();
+      if (lastActive != null && lastActive != nowKey && Storage.loadDayLog(lastActive) == null) {
+        _midnightCheckTimer?.cancel();
+        await _autoEndPreviousDay(lastActive);
+        if (mounted) _startMidnightCheckTimer();
+      }
+    });
   }
   
   void _onPomodoroUpdate() {
@@ -1448,6 +1479,7 @@ class _TodayScreenState extends State<TodayScreen> {
 
   @override
   void dispose() {
+    _midnightCheckTimer?.cancel();
     _pomo.removeListener(_onPomodoroUpdate);
     _pomo.dispose();
     super.dispose();
@@ -1488,7 +1520,50 @@ class _TodayScreenState extends State<TodayScreen> {
     );
   }
 
+  Future<void> _autoEndPreviousDay(String previousDayKey) async {
+    _pomo.pause();
+    _pomo.reset();
+    final tasks = Storage.loadActiveTasks();
+    final log = DayLog(
+      dayKey: previousDayKey,
+      mood: DayMood.meh,
+      mode: _mode,
+      tasksSnapshot: tasks.map((t) => t.toJson()).toList(),
+      archivedAt: DateTime.now(),
+    );
+    await Storage.saveDayLog(log);
+    final carried = tasks
+        .where((t) => t.status != TaskStatus.done)
+        .map((t) => t.copyWith(
+              updatedAt: DateTime.now(),
+              rolledOver: true,
+              carriedOverFromDay: previousDayKey,
+            ))
+        .toList();
+    await Storage.saveActiveTasks(carried);
+    await Storage.saveLastActiveDateKey(_todayKey);
+    if (mounted) {
+      setState(() {
+        _tasks
+          ..clear()
+          ..addAll(carried);
+      });
+      _pomo.sync();
+    }
+  }
+
   Future<void> _loadActive() async {
+    final todayKey = _todayKey;
+    final lastActive = Storage.loadLastActiveDateKey();
+    if (lastActive != null && lastActive != todayKey && Storage.loadDayLog(lastActive) == null) {
+      await _autoEndPreviousDay(lastActive);
+      if (_rules.mode == FlowMode.scrum) {
+        await Storage.cleanOrphanedSprintTaskIds(_tasks);
+      }
+      return;
+    }
+    await Storage.saveLastActiveDateKey(todayKey);
+
     // Sprint otomatik başlat (Scrum mode için)
     if (_rules.mode == FlowMode.scrum) {
       final sprint = Storage.loadActiveSprint();
@@ -1546,6 +1621,7 @@ class _TodayScreenState extends State<TodayScreen> {
 
   Future<void> _persist() async {
     await Storage.saveActiveTasks(_tasks);
+    await Storage.saveLastActiveDateKey(_todayKey);
     _pomo.sync();
   }
 
@@ -1712,28 +1788,45 @@ class _TodayScreenState extends State<TodayScreen> {
 
   void _duplicateTask(Task t) {
     HapticFeedback.lightImpact();
-    final now = DateTime.now();
-    final duplicated = Task(
-      id: now.millisecondsSinceEpoch.toString(),
-      title: '${t.title} (copy)',
-      status: TaskStatus.todo,
-      focus: t.focus,
-      createdAt: now,
-      updatedAt: now,
-      tags: List.from(t.tags),
-      dueDate: t.dueDate,
-    );
-    setState(() {
-      _tasks.add(duplicated);
+    // Defer to next frame to avoid issues when PopupMenu is closing
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final now = DateTime.now();
+      final duplicated = Task(
+        id: now.millisecondsSinceEpoch.toString(),
+        title: '${t.title} (copy)',
+        status: TaskStatus.todo,
+        focus: t.focus,
+        createdAt: now,
+        updatedAt: now,
+        tags: List.from(t.tags),
+        dueDate: t.dueDate,
+      );
+      setState(() {
+        _tasks.add(duplicated);
+      });
+      if (_mode == FlowMode.scrum) {
+        final sprint = Storage.loadActiveSprint();
+        if (sprint.taskIds.contains(t.id)) {
+          if (sprint.taskIds.length < 5) {
+            await Storage.addTaskToSprint(duplicated.id);
+          } else {
+            await Storage.addTaskToStretch(duplicated.id);
+          }
+        } else if (sprint.stretchTaskIds.contains(t.id)) {
+          await Storage.addTaskToStretch(duplicated.id);
+        }
+      }
+      _persist();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Duplicated "${t.title}"'),
+          duration: const Duration(seconds: 1),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
     });
-    _persist();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Duplicated "${t.title}"'),
-        duration: const Duration(seconds: 1),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
   }
 
   void _deleteTask(Task t) {
@@ -1800,6 +1893,42 @@ class _TodayScreenState extends State<TodayScreen> {
         ),
       );
     }
+  }
+
+  Future<void> _startNewSprint() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Start new sprint?'),
+        content: const Text(
+          'The current sprint will be archived and a new one will start. '
+          'Unfinished tasks will move to the backlog. Continue?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Start new sprint'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final current = Storage.loadActiveSprint();
+    await Storage.archiveSprint(current);
+    final newSprint = Sprint.createForThisWeek();
+    await Storage.saveActiveSprint(newSprint);
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('New sprint started: ${newSprint.name}'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   void _toggleCommit(Task t) {
@@ -2259,11 +2388,18 @@ widget.onOpenHistory();
               const SizedBox(height: AppSpacing.md),
               // Sprint Overview (sadece Scrum mode için)
               if (_rules.mode == FlowMode.scrum) ...[
-                _SprintOverviewCard(tasks: _tasks),
+                _SprintOverviewCard(
+                  tasks: _tasks,
+                  onStartNewSprint: _startNewSprint,
+                ),
                 const SizedBox(height: AppSpacing.md),
               ],
-              // Günlük Focus: 3 slot görseli
-              _DailyFocusSlots(doingCount: doingCount),
+              // Günlük Focus: 3 slot görseli (sadece seçili focus için)
+              _DailyFocusSlots(
+                doingCount: _rules.mode == FlowMode.scrum
+                    ? coreDoing.length
+                    : doing.length,
+              ),
               const SizedBox(height: AppSpacing.md),
               _FocusPills(
                 selected: _focus,
@@ -2610,6 +2746,42 @@ class _HistoryScreenState extends State<HistoryScreen> {
     });
   }
 
+  Future<void> _startNewSprint() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Start new sprint?'),
+        content: const Text(
+          'The current sprint will be archived and a new one will start. '
+          'Unfinished tasks will move to the backlog. Continue?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Start new sprint'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final current = Storage.loadActiveSprint();
+    await Storage.archiveSprint(current);
+    final newSprint = Sprint.createForThisWeek();
+    await Storage.saveActiveSprint(newSprint);
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('New sprint started: ${newSprint.name}'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final logs = _logs;
@@ -2623,7 +2795,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
     // Calculate statistics - Premium: 30 days, Free: 7 days
     final premium = Provider.of<PremiumController>(context);
     final daysToShow = premium.isPremium ? 30 : 7;
-    final lastDays = logs == null ? <DayLog>[] : logs.take(daysToShow).toList();
+    final lastDays = logs == null
+        ? <DayLog>[]
+        : visibleLogs.take(daysToShow).toList();
     final totalTasksDone = lastDays.fold<int>(0, (sum, log) => sum + log.doneCount);
     final avgTasksPerDay = lastDays.isEmpty ? 0.0 : totalTasksDone / lastDays.length;
     final totalPomodoros = lastDays.fold<int>(0, (sum, log) {
@@ -2657,40 +2831,30 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 8),
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  children: [
-                    _HistoryFilterChip(
-                      label: 'All',
-                      selected: _filter == null,
-                      onSelected: () {
-                        setState(() => _filter = null);
-                      },
-                    ),
-                    const SizedBox(width: AppSpacing.sm),
-                    _HistoryFilterChip(
-                      label: 'Sprint',
-                      selected: _filter == FlowMode.scrum,
-                      onSelected: () {
-                        setState(() => _filter = FlowMode.scrum);
-                      },
-                    ),
-                    const SizedBox(width: AppSpacing.sm),
-                    _HistoryFilterChip(
-                      label: 'Kanban',
-                      selected: _filter == FlowMode.kanban,
-                      onSelected: () {
-                        setState(() => _filter = FlowMode.kanban);
-                      },
-                    ),
-                  ],
-                ),
+              Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: 8,
+                children: [
+                  _HistoryFilterChip(
+                    label: 'All',
+                    selected: _filter == null,
+                    onSelected: () => setState(() => _filter = null),
+                  ),
+                  _HistoryFilterChip(
+                    label: 'Sprint',
+                    selected: _filter == FlowMode.scrum,
+                    onSelected: () => setState(() => _filter = FlowMode.scrum),
+                  ),
+                  _HistoryFilterChip(
+                    label: 'Kanban',
+                    selected: _filter == FlowMode.kanban,
+                    onSelected: () => setState(() => _filter = FlowMode.kanban),
+                  ),
+                ],
               ),
               const SizedBox(height: 12),
-              // Premium: Sprint History
-              if (premium.isPremium) ...[
-                _SprintHistorySection(),
+              if (premium.isPremium && _filter != FlowMode.kanban) ...[
+                _SprintHistorySection(onStartNewSprint: _startNewSprint),
                 const SizedBox(height: 12),
               ],
               if (lastDays.isNotEmpty)
@@ -2703,64 +2867,99 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   isPremium: premium.isPremium,
                 ),
               const SizedBox(height: 12),
-
-              // şimdilik filtre UI yok — önce build alalım.
-              // sonra ekleriz.
-
               Expanded(
                 child: _logs == null
-                    ? const _HistorySkeleton()
+                    ? const Center(
+                        child: SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      )
                     : visibleLogs.isEmpty
                         ? Center(
-                    child: Text(
-                      'No archived days yet.',
-                              style: TextStyle(
-                                color: context.themeTextMuted,
-                    ),
-                  ),
-                )
-                        : ListView.separated(
-                    itemCount: visibleLogs.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      final log = visibleLogs[i];
-
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Text(
+                                _filter == null
+                                    ? 'No archived days yet.'
+                                    : _filter == FlowMode.scrum
+                                        ? 'No Sprint days in history yet.'
+                                        : 'No Kanban days in history yet.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: context.themeTextMuted,
+                                ),
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            itemCount: visibleLogs.length,
+                            itemBuilder: (context, i) {
+                              final log = visibleLogs[i];
                               final workSessions =
                                   Storage.loadPomodoroSessions(log.dayKey)
                                       .where((s) =>
                                           s.phase == PomodoroPhase.work)
-                          .toList();
-
-                      final pomos = workSessions.length;
-                      final focusMinutes =
-                                  workSessions.fold<int>(
-                                      0, (sum, s) => sum + s.minutes);
-
-                              final commitBadge =
-                                  (log.mode == FlowMode.scrum)
-                          ? ' • ✅ ${log.committedDoneCount}/${log.committedCount}'
-                          : '';
-
-                      return _HistoryCard(
-                        dayKey: log.dayKey,
-                        emoji: moodToEmoji(log.mood),
-                        subtitle:
-                            '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • Focus $pomos ($focusMinutes min)$commitBadge',
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                      builder: (_) => DayDetailScreen(
-                                        dayKey: log.dayKey,
+                                      .toList();
+                              final pomos = workSessions.length;
+                              final focusMinutes = workSessions.fold<int>(
+                                  0, (sum, s) => sum + s.minutes);
+                              final commitBadge = (log.mode == FlowMode.scrum)
+                                  ? ' • ✅ ${log.committedDoneCount}/${log.committedCount}'
+                                  : '';
+                              final subtitle =
+                                  '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • Focus $pomos ($focusMinutes min)$commitBadge';
+                              return Card(
+                                elevation: 0,
+                                color: context.themeCard,
+                                margin: const EdgeInsets.only(bottom: 10),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                                child: ListTile(
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 8,
+                                  ),
+                                  leading: Text(
+                                    moodToEmoji(log.mood),
+                                    style: const TextStyle(fontSize: 22),
+                                  ),
+                                  title: Text(
+                                    log.dayKey,
+                                    style: const TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  subtitle: Text(
+                                    subtitle,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: context.themeTextMuted,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                  trailing: Icon(
+                                    Icons.chevron_right_rounded,
+                                    color: context.themeTextMuted,
+                                  ),
+                                  onTap: () {
+                                    Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => DayDetailScreen(
+                                          dayKey: log.dayKey,
+                                        ),
                                       ),
-                            ),
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
+                          ),
+              ),
             ],
           ),
         ),
@@ -2869,6 +3068,137 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
         ),
       ),
     );
+  }
+}
+
+/* ===================== Sprint Detail ===================== */
+
+class SprintDetailScreen extends StatelessWidget {
+  final Sprint sprint;
+
+  const SprintDetailScreen({super.key, required this.sprint});
+
+  @override
+  Widget build(BuildContext context) {
+    final allTasks = Storage.loadActiveTasks();
+    final coreTasks =
+        allTasks.where((t) => sprint.taskIds.contains(t.id)).toList();
+    final stretchTasks = allTasks
+        .where((t) => sprint.stretchTaskIds.contains(t.id))
+        .toList();
+    final coreDone = coreTasks.where((t) => t.status == TaskStatus.done).length;
+    final coreTotal = sprint.taskIds.length;
+    final isActive = sprint == Storage.loadActiveSprint();
+
+    return Scaffold(
+      backgroundColor: context.themeBg,
+      appBar: AppBar(
+        title: Text(sprint.name),
+        backgroundColor: Colors.transparent,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: context.themeCard,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Row(
+                    children: [
+                      if (isActive)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: context.themeAccent,
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: const Text(
+                            'Active',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      if (isActive) const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          '$coreDone/$coreTotal completed',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        '${sprint.completionPercentage(allTasks).toStringAsFixed(0)}%',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                          color: context.themeAccent,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${_formatDate(sprint.startDate)} – ${_formatDate(sprint.endDate)}',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: context.themeTextMuted,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _SectionCard(
+                  title: 'Sprint commitments',
+                  count: coreTasks.length,
+                  child: coreTasks.isEmpty
+                      ? Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(
+                            'No tasks in this sprint.',
+                            style: TextStyle(color: context.themeTextMuted),
+                          ),
+                        )
+                      : _ReadOnlyTaskList(
+                          tasks: coreTasks,
+                          dimmed: false,
+                        ),
+                ),
+                if (stretchTasks.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  _SectionCard(
+                    title: 'Stretch',
+                    count: stretchTasks.length,
+                    child: _ReadOnlyTaskList(
+                      tasks: stretchTasks,
+                      dimmed: true,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _formatDate(DateTime d) {
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+    ];
+    return '${months[d.month - 1]} ${d.day}';
   }
 }
 
@@ -3221,14 +3551,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: const [
                         Text(
-                          'Leanly: Agile Planner',
+                          'Leanly – Weekly Sprint Planner',
                           style: TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                         Text(
-                          'v1.0.0',
+                          'v1.2.2',
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w500,
@@ -4045,8 +4375,12 @@ class _SprintReviewScreenState extends State<_SprintReviewScreen> {
 
 class _SprintOverviewCard extends StatelessWidget {
   final List<Task> tasks;
+  final VoidCallback? onStartNewSprint;
 
-  const _SprintOverviewCard({required this.tasks});
+  const _SprintOverviewCard({
+    required this.tasks,
+    this.onStartNewSprint,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -4096,6 +4430,12 @@ class _SprintOverviewCard extends StatelessWidget {
                     ),
                   ],
                 ),
+                if (onStartNewSprint != null)
+                  IconButton(
+                    icon: const Icon(Icons.play_arrow_rounded),
+                    tooltip: 'Start new sprint',
+                    onPressed: onStartNewSprint,
+                  ),
               ],
             ),
             const SizedBox(height: AppSpacing.md),
@@ -4199,20 +4539,31 @@ class _SprintOverviewCard extends StatelessWidget {
                   ),
                 ],
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: context.themeAccent.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  '${percentage.toStringAsFixed(0)}%',
-                  style: TextStyle(
-                    fontSize: AppTypography.lg,
-                    fontWeight: FontWeight.w700,
-                    color: context.themeAccent,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: context.themeAccent.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      '${percentage.toStringAsFixed(0)}%',
+                      style: TextStyle(
+                        fontSize: AppTypography.lg,
+                        fontWeight: FontWeight.w700,
+                        color: context.themeAccent,
+                      ),
+                    ),
                   ),
-                ),
+                  if (onStartNewSprint != null)
+                    IconButton(
+                      icon: const Icon(Icons.play_arrow_rounded),
+                      tooltip: 'Start new sprint',
+                      onPressed: onStartNewSprint,
+                    ),
+                ],
               ),
             ],
           ),
@@ -5014,7 +5365,9 @@ class _TodaySkeleton extends StatelessWidget {
 }
 
 class _SprintHistorySection extends StatelessWidget {
-  const _SprintHistorySection();
+  final VoidCallback? onStartNewSprint;
+
+  const _SprintHistorySection({this.onStartNewSprint});
 
   @override
   Widget build(BuildContext context) {
@@ -5032,9 +5385,19 @@ class _SprintHistorySection extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (onStartNewSprint != null) ...[
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: onStartNewSprint,
+                icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                label: const Text('Start new sprint'),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           ...allSprints.take(5).map((sprint) {
             final isActive = sprint == activeSprint;
-            // Sprint'in tasklarını yüklemek için tüm taskları al
             final allTasks = Storage.loadActiveTasks();
             final completed = sprint.completedCount(allTasks);
             final total = sprint.totalCount();
@@ -5042,74 +5405,96 @@ class _SprintHistorySection extends StatelessWidget {
 
             return Padding(
               padding: const EdgeInsets.only(bottom: 12),
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: isActive 
-                      ? context.themeAccent.withOpacity(0.1)
-                      : context.themeSoftRow,
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
                   borderRadius: BorderRadius.circular(12),
-                  border: isActive
-                      ? Border.all(color: context.themeAccent, width: 1)
-                      : null,
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => SprintDetailScreen(sprint: sprint),
+                      ),
+                    );
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? context.themeAccent.withOpacity(0.1)
+                          : context.themeSoftRow,
+                      borderRadius: BorderRadius.circular(12),
+                      border: isActive
+                          ? Border.all(color: context.themeAccent, width: 1)
+                          : null,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Expanded(
-                          child: Text(
-                            sprint.name,
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w600,
-                              color: isActive ? context.themeAccent : null,
-                            ),
-                          ),
-                        ),
-                        if (isActive)
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: context.themeAccent,
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: const Text(
-                              'Active',
-                              style: TextStyle(
-                                fontSize: 10,
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                sprint.name,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600,
+                                  color: isActive
+                                      ? context.themeAccent
+                                      : null,
+                                ),
                               ),
                             ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            '$completed/$total completed',
-                            style: TextStyle(
-                              fontSize: 12,
+                            if (isActive)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: context.themeAccent,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: const Text(
+                                  'Active',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '$completed/$total completed',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: context.themeTextMuted,
+                                ),
+                              ),
+                            ),
+                            Icon(
+                              Icons.chevron_right_rounded,
+                              size: 20,
                               color: context.themeTextMuted,
                             ),
-                          ),
-                        ),
-                        Text(
-                          '${percentage.toStringAsFixed(0)}%',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: context.themeAccent,
-                          ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '${percentage.toStringAsFixed(0)}%',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: context.themeAccent,
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             );
@@ -5202,10 +5587,11 @@ class _HistoryFilterChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChoiceChip(
+    return FilterChip(
       label: Text(label),
       selected: selected,
       onSelected: (_) => onSelected(),
+      showCheckmark: selected,
       labelStyle: TextStyle(
         fontSize: AppTypography.sm,
         fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
@@ -5740,52 +6126,36 @@ class _HistoryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(18),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: context.themeCard,
-          borderRadius: BorderRadius.circular(18),
+    return Card(
+      elevation: 0,
+      color: context.themeCard,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        leading: Text(emoji, style: const TextStyle(fontSize: 22)),
+        title: Text(
+          dayKey,
+          style: const TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
         ),
-        child: Row(
-          children: [
-            Text(emoji, style: const TextStyle(fontSize: 22)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-  dayKey,
-  style: const TextStyle(
-    fontSize: 15,
-    fontWeight: FontWeight.w700,
-  ),
-),
-
-                  const SizedBox(height: 4),
-                  Text(
-  subtitle,
-  maxLines: 2,
-  overflow: TextOverflow.ellipsis,
-  style: TextStyle(
-    color: context.themeTextMuted,
-    height: 1.3,
-  ),
-),
-
-                ],
-              ),
-            ),
-            Icon(
-  Icons.chevron_right_rounded,
-  color: context.themeTextMuted,
-),
-
-          ],
+        subtitle: Text(
+          subtitle,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: context.themeTextMuted,
+            height: 1.3,
+          ),
         ),
+        trailing: Icon(
+          Icons.chevron_right_rounded,
+          color: context.themeTextMuted,
+        ),
+        onTap: onTap,
       ),
     );
   }
