@@ -53,18 +53,32 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   bool _darkMode = Storage.loadDarkMode();
+  AppTheme _theme = Storage.loadTheme();
   late final PremiumController _premiumController;
 
   @override
   void initState() {
     super.initState();
     _premiumController = PremiumController();
+    // Listen to premium changes to update theme if needed
+    _premiumController.addListener(_onPremiumChanged);
   }
 
   @override
   void dispose() {
+    _premiumController.removeListener(_onPremiumChanged);
     _premiumController.dispose();
     super.dispose();
+  }
+
+  void _onPremiumChanged() {
+    // If user loses premium, reset to default theme
+    if (!_premiumController.isPremium && _theme != AppTheme.calm) {
+      setState(() {
+        _theme = AppTheme.calm;
+      });
+      Storage.saveTheme(AppTheme.calm);
+    }
   }
 
   void toggleDarkMode(bool value) {
@@ -74,6 +88,13 @@ class _MyAppState extends State<MyApp> {
     Storage.saveDarkMode(value);
   }
 
+  void setTheme(AppTheme theme) {
+    setState(() {
+      _theme = theme;
+    });
+    Storage.saveTheme(theme);
+  }
+
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider.value(
@@ -81,11 +102,12 @@ class _MyAppState extends State<MyApp> {
       child: MaterialApp(
         title: 'Leanly: Agile Planner',
         debugShowCheckedModeBanner: false,
-        theme: buildCalmTheme(),
-        darkTheme: buildCalmDarkTheme(),
+        theme: buildTheme(_theme, false),
+        darkTheme: buildTheme(_theme, true),
         themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
         home: AppShell(
           onDarkModeChanged: toggleDarkMode,
+          onThemeChanged: setTheme,
         ),
       ),
     );
@@ -98,6 +120,7 @@ enum TaskStatus { todo, doing, done }
 enum Focus { work, personal, learning }
 enum DayMood { good, meh, hard }
 enum FlowMode { scrum, kanban, xp }
+enum AppTheme { calm, ocean, forest, sunset, darkProfessional }
 
 String moodToEmoji(DayMood m) {
   switch (m) {
@@ -357,6 +380,28 @@ class Storage {
     await box.put(settingsKey, map);
   }
 
+  static AppTheme loadTheme() {
+    final raw = box.get(settingsKey);
+    if (raw is Map) {
+      final t = raw['theme'] as String?;
+      if (t != null) {
+        return AppTheme.values.firstWhere(
+          (e) => e.name == t,
+          orElse: () => AppTheme.calm,
+        );
+      }
+    }
+    return AppTheme.calm;
+  }
+
+  static Future<void> saveTheme(AppTheme theme) async {
+    final existing = box.get(settingsKey);
+    final map = <String, dynamic>{};
+    if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
+    map['theme'] = theme.name;
+    await box.put(settingsKey, map);
+  }
+
   static bool hasSeenOnboarding() {
     final raw = box.get(settingsKey);
     if (raw is Map) {
@@ -425,8 +470,10 @@ class PremiumController extends ChangeNotifier {
   bool _isPremium = false;
   final InAppPurchase _inAppPurchase = InAppPurchase.instance;
   StreamSubscription<List<PurchaseDetails>>? _subscription;
+  String? _lastPurchaseError;
 
   bool get isPremium => _isPremium;
+  String? get lastPurchaseError => _lastPurchaseError;
 
   PremiumController() {
     _loadPremiumStatus();
@@ -442,7 +489,11 @@ class PremiumController extends ChangeNotifier {
     _subscription = _inAppPurchase.purchaseStream.listen(
       _onPurchaseUpdate,
       onDone: () => _subscription?.cancel(),
-      onError: (error) => debugPrint('Purchase stream error: $error'),
+      onError: (error) {
+        debugPrint('Purchase stream error: $error');
+        _lastPurchaseError = 'Connection error. Please check your internet connection.';
+        notifyListeners();
+      },
     );
   }
 
@@ -451,14 +502,46 @@ class PremiumController extends ChangeNotifier {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         if (purchase.productID == _kPremiumProductId) {
+          _lastPurchaseError = null; // Clear error on success
           await _setPremiumStatus(true);
           if (purchase.pendingCompletePurchase) {
             await _inAppPurchase.completePurchase(purchase);
           }
+          notifyListeners();
         }
       } else if (purchase.status == PurchaseStatus.error) {
-        debugPrint('Purchase error: ${purchase.error}');
+        final error = purchase.error;
+        debugPrint('Purchase error: $error');
+        if (error != null) {
+          _lastPurchaseError = _getErrorMessage(error);
+        } else {
+          _lastPurchaseError = 'Purchase failed. Please try again.';
+        }
+        notifyListeners();
+      } else if (purchase.status == PurchaseStatus.pending) {
+        debugPrint('Purchase pending: ${purchase.productID}');
       }
+    }
+  }
+
+  String _getErrorMessage(IAPError error) {
+    final code = error.code;
+    final message = error.message ?? 'Unknown error';
+    
+    // Map common error codes to user-friendly messages
+    switch (code) {
+      case 'storekit_unknown':
+        return 'Purchase failed. Please try again later.';
+      case 'storekit_product_not_available':
+        return 'Product not available. Please contact support.';
+      case 'storekit_purchase_invalid':
+        return 'Purchase invalid. Please try again.';
+      case 'storekit_purchase_not_allowed':
+        return 'Purchase not allowed. Please check your device settings.';
+      case 'storekit_purchase_cancelled':
+        return 'Purchase cancelled.';
+      default:
+        return 'Purchase failed: $message. Please try again.';
     }
   }
 
@@ -468,10 +551,21 @@ class PremiumController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Debug only: Manually set premium status for testing
+  Future<void> setPremiumStatusForDebug(bool value) async {
+    await _setPremiumStatus(value);
+  }
+
   Future<bool> buyPremium() async {
     try {
+      _lastPurchaseError = null; // Clear previous error
+      notifyListeners();
+      
       final available = await _inAppPurchase.isAvailable();
       if (!available) {
+        _lastPurchaseError = 'In-app purchases are not available on this device.';
+        notifyListeners();
+        debugPrint('In-app purchases not available');
         return false;
       }
 
@@ -480,11 +574,16 @@ class PremiumController extends ChangeNotifier {
       );
 
       if (productDetailsResponse.error != null) {
-        debugPrint('Product query error: ${productDetailsResponse.error}');
+        final error = productDetailsResponse.error!;
+        _lastPurchaseError = 'Failed to load product: ${error.message ?? "Unknown error"}. Please try again.';
+        notifyListeners();
+        debugPrint('Product query error: ${error.code} - ${error.message}');
         return false;
       }
 
       if (productDetailsResponse.productDetails.isEmpty) {
+        _lastPurchaseError = 'Product not found. Please make sure the app is up to date.';
+        notifyListeners();
         debugPrint('Product not found: $_kPremiumProductId');
         return false;
       }
@@ -494,8 +593,17 @@ class PremiumController extends ChangeNotifier {
         productDetails: productDetails,
       );
 
-      return await _inAppPurchase.buyNonConsumable(purchaseParam: purchaseParam);
+      final result = await _inAppPurchase.buyNonConsumable(purchaseParam: purchaseParam);
+      
+      if (!result) {
+        _lastPurchaseError = 'Failed to initiate purchase. Please try again.';
+        notifyListeners();
+      }
+      
+      return result;
     } catch (e) {
+      _lastPurchaseError = 'An unexpected error occurred: $e. Please try again.';
+      notifyListeners();
       debugPrint('Buy premium error: $e');
       return false;
     }
@@ -503,9 +611,16 @@ class PremiumController extends ChangeNotifier {
 
   Future<bool> restorePurchases() async {
     try {
+      _lastPurchaseError = null; // Clear previous error
+      notifyListeners();
+      
       await _inAppPurchase.restorePurchases();
+      // Note: restorePurchases() doesn't return a value, 
+      // the purchase stream will notify us of restored purchases
       return true;
     } catch (e) {
+      _lastPurchaseError = 'Failed to restore purchases: $e. Please try again.';
+      notifyListeners();
       debugPrint('Restore purchases error: $e');
       return false;
     }
@@ -720,10 +835,12 @@ class PomodoroController extends ChangeNotifier {
 
 class AppShell extends StatefulWidget {
   final void Function(bool) onDarkModeChanged;
+  final void Function(AppTheme)? onThemeChanged;
 
   const AppShell({
     super.key,
     required this.onDarkModeChanged,
+    this.onThemeChanged,
   });
 
   @override
@@ -756,6 +873,7 @@ class _AppShellState extends State<AppShell> {
       const HistoryScreen(),
       SettingsScreen(
         onDarkModeChanged: widget.onDarkModeChanged,
+        onThemeChanged: widget.onThemeChanged,
       ),
     ];
 
@@ -1944,10 +2062,12 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
 
 class SettingsScreen extends StatefulWidget {
   final void Function(bool) onDarkModeChanged;
+  final void Function(AppTheme)? onThemeChanged;
 
   const SettingsScreen({
     super.key,
     required this.onDarkModeChanged,
+    this.onThemeChanged,
   });
 
   @override
@@ -1957,12 +2077,14 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late FlowMode _mode;
   late bool _darkMode;
+  late AppTheme _theme;
 
   @override
   void initState() {
     super.initState();
     _mode = Storage.loadMode();
     _darkMode = Storage.loadDarkMode();
+    _theme = Storage.loadTheme();
   }
 
   Future<void> _setMode(FlowMode m) async {
@@ -1974,6 +2096,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _darkMode = value);
     await Storage.saveDarkMode(value);
     widget.onDarkModeChanged(value);
+  }
+
+  Future<void> _setTheme(AppTheme theme) async {
+    setState(() => _theme = theme);
+    await Storage.saveTheme(theme);
+    widget.onThemeChanged?.call(theme);
   }
 
   @override
@@ -2002,14 +2130,72 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _SectionCard(
                 title: 'Appearance',
                 count: 0,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Dark Mode',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-                    Switch(
-                      value: _darkMode,
-                      onChanged: _setDarkMode,
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Dark Mode',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                        Switch(
+                          value: _darkMode,
+                          onChanged: _setDarkMode,
+                        ),
+                      ],
+                    ),
+                    Consumer<PremiumController>(
+                      builder: (context, premium, _) {
+                        if (!premium.isPremium) {
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: Row(
+                              children: [
+                                Icon(Icons.lock_outline, size: 16, color: context.themeTextMuted),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    'Themes are available in Leanly Pro',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: context.themeTextMuted,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const SizedBox(height: 16),
+                            const Text(
+                              'Theme',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                            ),
+                            const SizedBox(height: 12),
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
+                              children: AppTheme.values.map((theme) {
+                                final isSelected = theme == _theme;
+                                return ChoiceChip(
+                                  selected: isSelected,
+                                  label: Text(AppThemes.getDisplayName(theme)),
+                                  onSelected: (_) => _setTheme(theme),
+                                  selectedColor: context.themeAccent,
+                                  backgroundColor: context.themeCard,
+                                  labelStyle: TextStyle(
+                                    color: isSelected ? Colors.white : null,
+                                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ],
+                        );
+                      },
                     ),
                   ],
                 ),
@@ -2179,6 +2365,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                 ),
               ),
+              // Debug: Premium toggle (only in debug mode)
+              if (kDebugMode) ...[
+                const SizedBox(height: 12),
+                _SectionCard(
+                  title: 'Debug',
+                  count: 0,
+                  child: Consumer<PremiumController>(
+                    builder: (context, premium, _) {
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text(
+                                'Premium Status (Debug)',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              Switch(
+                                value: premium.isPremium,
+                                onChanged: (value) async {
+                                  final controller = Provider.of<PremiumController>(context, listen: false);
+                                  await controller.setPremiumStatusForDebug(value);
+                                },
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            premium.isPremium
+                                ? 'Premium is ACTIVE (Debug Mode)'
+                                : 'Premium is INACTIVE (Debug Mode)',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: context.themeTextMuted,
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
             ],
             ),
           ),
@@ -2301,10 +2533,14 @@ class _PremiumScreenState extends State<PremiumScreen> {
                               ),
                             );
                           } else {
+                            // Show detailed error message if available
+                            final errorMessage = premium.lastPurchaseError ?? 
+                                'Purchase failed. Please try again.';
                             ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Purchase failed. Please try again.'),
+                              SnackBar(
+                                content: Text(errorMessage),
                                 behavior: SnackBarBehavior.floating,
+                                duration: const Duration(seconds: 4),
                               ),
                             );
                           }
@@ -3350,40 +3586,156 @@ class AppTypography {
   static const double xxxl = 32.0;
 }
 
-// Light mode colors - Improved contrast and vibrancy
-const Color kAccent = Color(0xFF7C7EF2); // Slightly more vibrant lilac
-const Color kBg = Color(0xFFF1F3F5); // Slightly darker for better contrast
-const Color kCard = Colors.white;
-const Color kSoftRow = Color(0xFFF0F2F5); // More contrast from bg
-const Color kSoftRowDim = Color(0xFFE8EAED); // Even more contrast
-const Color kTextMuted = Color(0xFF64748B); // Better readability
+// ===================== Theme System =====================
 
-// Semantic colors
-const Color kSuccess = Color(0xFF10B981); // Green
-const Color kWarning = Color(0xFFF59E0B); // Amber
-const Color kError = Color(0xFFEF4444); // Red
-const Color kInfo = Color(0xFF3B82F6); // Blue
+// Theme color palettes
+class ThemePalette {
+  final Color accent;
+  final Color bg;
+  final Color card;
+  final Color softRow;
+  final Color softRowDim;
+  final Color textMuted;
 
-ThemeData buildCalmTheme() {
-  return ThemeData(
-    useMaterial3: true,
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: kAccent,
-      brightness: Brightness.light,
-    ),
-    scaffoldBackgroundColor: kBg,
-  );
+  const ThemePalette({
+    required this.accent,
+    required this.bg,
+    required this.card,
+    required this.softRow,
+    required this.softRowDim,
+    required this.textMuted,
+  });
 }
 
-// Dark mode colors - Improved depth and contrast
-const Color kAccentDark = Color(0xFF8B8CF6); // Slightly brighter
-const Color kBgDark = Color(0xFF0F172A); // Slightly darker base
-const Color kCardDark = Color(0xFF1E293B); // More contrast from bg
-const Color kSoftRowDark = Color(0xFF334155); // Better separation from card
-const Color kSoftRowDimDark = Color(0xFF475569); // Even more contrast
-const Color kTextMutedDark = Color(0xFF94A3B8); // Better readability
+// Theme definitions
+class AppThemes {
+  // Calm (Default) - Lilac
+  static const ThemePalette calmLight = ThemePalette(
+    accent: Color(0xFF7C7EF2),
+    bg: Color(0xFFF1F3F5),
+    card: Colors.white,
+    softRow: Color(0xFFF0F2F5),
+    softRowDim: Color(0xFFE8EAED),
+    textMuted: Color(0xFF64748B),
+  );
+  static const ThemePalette calmDark = ThemePalette(
+    accent: Color(0xFF8B8CF6),
+    bg: Color(0xFF0F172A),
+    card: Color(0xFF1E293B),
+    softRow: Color(0xFF334155),
+    softRowDim: Color(0xFF475569),
+    textMuted: Color(0xFF94A3B8),
+  );
 
-// Dark mode semantic colors (slightly adjusted for dark theme)
+  // Ocean - Blue/Teal
+  static const ThemePalette oceanLight = ThemePalette(
+    accent: Color(0xFF06B6D4),
+    bg: Color(0xFFF0F9FF),
+    card: Colors.white,
+    softRow: Color(0xFFE0F2FE),
+    softRowDim: Color(0xFFBAE6FD),
+    textMuted: Color(0xFF475569),
+  );
+  static const ThemePalette oceanDark = ThemePalette(
+    accent: Color(0xFF22D3EE),
+    bg: Color(0xFF0C1E2A),
+    card: Color(0xFF1E3A4A),
+    softRow: Color(0xFF2D4A5A),
+    softRowDim: Color(0xFF3D5A6A),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Forest - Green
+  static const ThemePalette forestLight = ThemePalette(
+    accent: Color(0xFF10B981),
+    bg: Color(0xFFF0FDF4),
+    card: Colors.white,
+    softRow: Color(0xFFDCFCE7),
+    softRowDim: Color(0xFFBBF7D0),
+    textMuted: Color(0xFF475569),
+  );
+  static const ThemePalette forestDark = ThemePalette(
+    accent: Color(0xFF34D399),
+    bg: Color(0xFF0F1F15),
+    card: Color(0xFF1E3A2A),
+    softRow: Color(0xFF2D4A3A),
+    softRowDim: Color(0xFF3D5A4A),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Sunset - Orange/Pink
+  static const ThemePalette sunsetLight = ThemePalette(
+    accent: Color(0xFFF97316),
+    bg: Color(0xFFFFF7ED),
+    card: Colors.white,
+    softRow: Color(0xFFFFEDD5),
+    softRowDim: Color(0xFFFFD7B5),
+    textMuted: Color(0xFF64748B),
+  );
+  static const ThemePalette sunsetDark = ThemePalette(
+    accent: Color(0xFFFB923C),
+    bg: Color(0xFF1F0F0A),
+    card: Color(0xFF3A1F15),
+    softRow: Color(0xFF4A2F25),
+    softRowDim: Color(0xFF5A3F35),
+    textMuted: Color(0xFF94A3B8),
+  );
+
+  // Dark Professional - Monochrome
+  static const ThemePalette darkProfessionalLight = ThemePalette(
+    accent: Color(0xFF6366F1),
+    bg: Color(0xFFFAFAFA),
+    card: Colors.white,
+    softRow: Color(0xFFF5F5F5),
+    softRowDim: Color(0xFFE5E5E5),
+    textMuted: Color(0xFF6B7280),
+  );
+  static const ThemePalette darkProfessionalDark = ThemePalette(
+    accent: Color(0xFF818CF8),
+    bg: Color(0xFF0A0A0A),
+    card: Color(0xFF1A1A1A),
+    softRow: Color(0xFF2A2A2A),
+    softRowDim: Color(0xFF3A3A3A),
+    textMuted: Color(0xFF9CA3AF),
+  );
+
+  static ThemePalette getPalette(AppTheme theme, bool isDark) {
+    switch (theme) {
+      case AppTheme.calm:
+        return isDark ? calmDark : calmLight;
+      case AppTheme.ocean:
+        return isDark ? oceanDark : oceanLight;
+      case AppTheme.forest:
+        return isDark ? forestDark : forestLight;
+      case AppTheme.sunset:
+        return isDark ? sunsetDark : sunsetLight;
+      case AppTheme.darkProfessional:
+        return isDark ? darkProfessionalDark : darkProfessionalLight;
+    }
+  }
+
+  static String getDisplayName(AppTheme theme) {
+    switch (theme) {
+      case AppTheme.calm:
+        return 'Calm';
+      case AppTheme.ocean:
+        return 'Ocean';
+      case AppTheme.forest:
+        return 'Forest';
+      case AppTheme.sunset:
+        return 'Sunset';
+      case AppTheme.darkProfessional:
+        return 'Dark Professional';
+    }
+  }
+}
+
+// Semantic colors (same for all themes)
+const Color kSuccess = Color(0xFF10B981);
+const Color kWarning = Color(0xFFF59E0B);
+const Color kError = Color(0xFFEF4444);
+const Color kInfo = Color(0xFF3B82F6);
+
 const Color kSuccessDark = Color(0xFF34D399);
 const Color kWarningDark = Color(0xFFFBBF24);
 const Color kErrorDark = Color(0xFFF87171);
@@ -3391,12 +3743,19 @@ const Color kInfoDark = Color(0xFF60A5FA);
 
 // Helper extension to get theme-aware colors
 extension ThemeColors on BuildContext {
-  Color get themeBg => Theme.of(this).brightness == Brightness.dark ? kBgDark : kBg;
-  Color get themeCard => Theme.of(this).brightness == Brightness.dark ? kCardDark : kCard;
-  Color get themeSoftRow => Theme.of(this).brightness == Brightness.dark ? kSoftRowDark : kSoftRow;
-  Color get themeSoftRowDim => Theme.of(this).brightness == Brightness.dark ? kSoftRowDimDark : kSoftRowDim;
-  Color get themeTextMuted => Theme.of(this).brightness == Brightness.dark ? kTextMutedDark : kTextMuted;
-  Color get themeAccent => Theme.of(this).brightness == Brightness.dark ? kAccentDark : kAccent;
+  ThemePalette get _palette {
+    final premium = Provider.of<PremiumController>(this, listen: false);
+    final appTheme = premium.isPremium ? Storage.loadTheme() : AppTheme.calm;
+    final isDark = Theme.of(this).brightness == Brightness.dark;
+    return AppThemes.getPalette(appTheme, isDark);
+  }
+
+  Color get themeBg => _palette.bg;
+  Color get themeCard => _palette.card;
+  Color get themeSoftRow => _palette.softRow;
+  Color get themeSoftRowDim => _palette.softRowDim;
+  Color get themeTextMuted => _palette.textMuted;
+  Color get themeAccent => _palette.accent;
   
   // Semantic colors
   Color get themeSuccess => Theme.of(this).brightness == Brightness.dark ? kSuccessDark : kSuccess;
@@ -3405,16 +3764,21 @@ extension ThemeColors on BuildContext {
   Color get themeInfo => Theme.of(this).brightness == Brightness.dark ? kInfoDark : kInfo;
 }
 
-ThemeData buildCalmDarkTheme() {
+ThemeData buildTheme(AppTheme theme, bool isDark) {
+  final palette = AppThemes.getPalette(theme, isDark);
   return ThemeData(
     useMaterial3: true,
     colorScheme: ColorScheme.fromSeed(
-      seedColor: kAccentDark,
-      brightness: Brightness.dark,
+      seedColor: palette.accent,
+      brightness: isDark ? Brightness.dark : Brightness.light,
     ),
-    scaffoldBackgroundColor: kBgDark,
+    scaffoldBackgroundColor: palette.bg,
   );
 }
+
+// Legacy functions for backward compatibility
+ThemeData buildCalmTheme() => buildTheme(AppTheme.calm, false);
+ThemeData buildCalmDarkTheme() => buildTheme(AppTheme.calm, true);
 
 class TopIconButton extends StatelessWidget {
   final IconData icon;
