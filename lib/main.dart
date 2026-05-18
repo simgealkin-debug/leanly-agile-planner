@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -10,8 +13,13 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:flutter/foundation.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:provider/provider.dart';
+import 'package:sign_in_with_apple/sign_in_with_apple.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'supabase_config.dart';
+import 'sync_bus.dart';
 
+part 'leanly_supabase.dart';
 
 final FlutterLocalNotificationsPlugin notifications =
     FlutterLocalNotificationsPlugin();
@@ -24,6 +32,16 @@ Future<void> main() async {
   // Initialize Hive
   await Hive.initFlutter();
   await Hive.openBox(Storage.boxName);
+
+  if (SupabaseConfig.isConfigured) {
+    await Supabase.initialize(
+      url: SupabaseConfig.url,
+      anonKey: SupabaseConfig.anonKey,
+      authOptions: const FlutterAuthClientOptions(
+        authFlowType: AuthFlowType.pkce,
+      ),
+    );
+  }
 
   // Initialize timezone
   tz.initializeTimeZones();
@@ -97,8 +115,20 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider.value(
-      value: _premiumController,
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: _premiumController),
+        ChangeNotifierProvider(
+          create: (_) {
+            final auth = SupabaseAuthController();
+            auth.attach();
+            return auth;
+          },
+        ),
+        ChangeNotifierProvider<CloudLoginGateNotifier>.value(
+          value: CloudLoginGateNotifier.instance,
+        ),
+      ],
       child: MaterialApp(
         title: 'Leanly: Agile Planner',
         debugShowCheckedModeBanner: false,
@@ -119,17 +149,36 @@ class _MyAppState extends State<MyApp> {
 enum TaskStatus { todo, doing, done }
 enum Focus { work, personal, learning }
 enum DayMood { good, meh, hard }
-enum FlowMode { scrum, kanban, xp }
+enum FlowMode { scrum, kanban }
+
+FlowMode parseFlowMode(String name) {
+  if (name == 'xp') return FlowMode.kanban;
+  return FlowMode.values.firstWhere(
+    (e) => e.name == name,
+    orElse: () => FlowMode.kanban,
+  );
+}
 enum AppTheme { calm, ocean, forest, sunset, darkProfessional }
 
-String moodToEmoji(DayMood m) {
+IconData moodToIcon(DayMood m) {
   switch (m) {
     case DayMood.good:
-      return '🙂';
+      return Icons.sentiment_satisfied_alt_rounded;
     case DayMood.meh:
-      return '😐';
+      return Icons.sentiment_neutral_rounded;
     case DayMood.hard:
-      return '🙁';
+      return Icons.sentiment_dissatisfied_rounded;
+  }
+}
+
+String moodToLabel(DayMood m) {
+  switch (m) {
+    case DayMood.good:
+      return 'Good';
+    case DayMood.meh:
+      return 'Meh';
+    case DayMood.hard:
+      return 'Hard';
   }
 }
 
@@ -255,8 +304,7 @@ class DayLog {
         dayKey: json['dayKey'] as String,
         mood: DayMood.values
             .firstWhere((e) => e.name == (json['mood'] as String)),
-        mode: FlowMode.values
-            .firstWhere((e) => e.name == (json['mode'] as String)),
+        mode: parseFlowMode(json['mode'] as String),
         tasksSnapshot: (json['tasksSnapshot'] as List)
             .map((e) => Map<String, dynamic>.from(e))
             .toList(),
@@ -331,10 +379,7 @@ class Storage {
     if (raw is Map) {
       final m = raw['mode'] as String?;
       if (m != null) {
-        return FlowMode.values.firstWhere(
-          (e) => e.name == m,
-          orElse: () => FlowMode.kanban,
-        );
+        return parseFlowMode(m);
       }
     }
     return FlowMode.kanban;
@@ -418,6 +463,24 @@ class Storage {
     await box.put(settingsKey, map);
   }
 
+  /// When true, full-screen cloud login is skipped (local-only or dismissed).
+  /// Default: skip if Supabase is not configured; otherwise show gate until set.
+  static bool loadSkipCloudLogin() {
+    final raw = box.get(settingsKey);
+    if (raw is Map && raw.containsKey('skipCloudLogin')) {
+      return (raw['skipCloudLogin'] as bool?) ?? false;
+    }
+    return !SupabaseConfig.isConfigured;
+  }
+
+  static Future<void> saveSkipCloudLogin(bool value) async {
+    final existing = box.get(settingsKey);
+    final map = <String, dynamic>{};
+    if (existing is Map) map.addAll(Map<String, dynamic>.from(existing));
+    map['skipCloudLogin'] = value;
+    await box.put(settingsKey, map);
+  }
+
   static Future<void> saveDayLog(DayLog log) async {
     await box.put(dayLogKey(log.dayKey), log.toJson());
   }
@@ -458,6 +521,34 @@ class Storage {
     final list = raw.map((e) => Map<String, dynamic>.from(e)).toList();
     list.add(s.toJson());
     await box.put(key, list);
+  }
+
+  static Map<String, dynamic>? loadSettingsMap() {
+    final raw = box.get(settingsKey);
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return null;
+  }
+
+  static Future<void> replaceSettingsMap(Map<String, dynamic> map) async {
+    await box.put(settingsKey, map);
+  }
+
+  static List<String> pomodoroStorageDayKeys() {
+    return box.keys
+        .whereType<String>()
+        .where((k) => k.startsWith('pomodoro_'))
+        .map((k) => k.substring('pomodoro_'.length))
+        .toList();
+  }
+
+  static Future<void> replacePomodoroSessions(
+    String dayKey,
+    List<PomodoroSession> sessions,
+  ) async {
+    await box.put(
+      pomodoroKey(dayKey),
+      sessions.map((s) => s.toJson()).toList(),
+    );
   }
 }
 
@@ -645,8 +736,6 @@ class ModeRules {
         return 'Scrum';
       case FlowMode.kanban:
         return 'Kanban';
-      case FlowMode.xp:
-        return 'XP';
     }
   }
 
@@ -654,8 +743,6 @@ class ModeRules {
     switch (mode) {
       case FlowMode.kanban:
         return 2;
-      case FlowMode.xp:
-        return 1;
       case FlowMode.scrum:
         return null;
     }
@@ -865,10 +952,29 @@ class _AppShellState extends State<AppShell> {
       return OnboardingScreen(onComplete: _completeOnboarding);
     }
 
+    return ListenableBuilder(
+      listenable: CloudLoginGateNotifier.instance,
+      builder: (context, _) {
+        return Consumer<SupabaseAuthController>(
+          builder: (context, auth, _) {
+            final skip = Storage.loadSkipCloudLogin();
+            final needCloudGate =
+                auth.isConfigured && !auth.isSignedIn && !skip;
+            if (needCloudGate) {
+              return const _CloudGateScreen();
+            }
+            return _buildAppShellBody();
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildAppShellBody() {
     final pages = [
       TodayScreen(
         onOpenHistory: () => _go(1),
-        onOpenSettings: () => _go(2),
+        onDarkModeChanged: widget.onDarkModeChanged,
       ),
       const HistoryScreen(),
       SettingsScreen(
@@ -880,13 +986,145 @@ class _AppShellState extends State<AppShell> {
     return Scaffold(
       body: pages[_index],
       bottomNavigationBar: NavigationBar(
+        height: 72,
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         selectedIndex: _index,
         onDestinationSelected: _go,
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.today), label: 'Today'),
-          NavigationDestination(icon: Icon(Icons.history), label: 'History'),
-          NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+          NavigationDestination(
+            icon: Icon(Icons.today_outlined),
+            selectedIcon: Icon(Icons.today),
+            label: 'Today',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.history_outlined),
+            selectedIcon: Icon(Icons.history),
+            label: 'History',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: 'Settings',
+          ),
         ],
+      ),
+    );
+  }
+}
+
+/// Full-screen sign-in before the main tabs when Supabase is configured.
+class _CloudGateScreen extends StatefulWidget {
+  const _CloudGateScreen();
+
+  @override
+  State<_CloudGateScreen> createState() => _CloudGateScreenState();
+}
+
+class _CloudGateScreenState extends State<_CloudGateScreen> {
+  bool _busy = false;
+
+  Future<void> _onAppleSignIn() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final auth = context.read<SupabaseAuthController>();
+    setState(() => _busy = true);
+    final err = await auth.signInWithApple();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(err ?? 'Signed in.'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _onContinueOffline() async {
+    await Storage.saveSkipCloudLogin(true);
+    CloudLoginGateNotifier.instance.refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final auth = context.watch<SupabaseAuthController>();
+    final canApple = !kIsWeb && (Platform.isIOS || Platform.isMacOS);
+
+    return Scaffold(
+      backgroundColor: context.themeBg,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 24),
+              Text(
+                'Leanly',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.w800,
+                  color: context.themeAccent,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Sign in to sync',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                auth.isConfigured
+                    ? 'Use your Apple account to back up tasks, history, and settings to the cloud. You can use the app offline instead if you prefer.'
+                    : 'Cloud is not configured.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 15,
+                  height: 1.45,
+                  color: context.themeTextMuted,
+                ),
+              ),
+              const Spacer(),
+              if (auth.isConfigured && canApple)
+                FilledButton.icon(
+                  onPressed: _busy ? null : _onAppleSignIn,
+                  icon: _busy
+                      ? SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Theme.of(context).colorScheme.onPrimary,
+                          ),
+                        )
+                      : const Icon(Icons.apple, size: 26),
+                  label: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Text(_busy ? 'Signing in…' : 'Sign in with Apple'),
+                  ),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                )
+              else if (auth.isConfigured)
+                Text(
+                  'Sign in with Apple is only available on iOS and Mac.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: context.themeTextMuted),
+                ),
+              const SizedBox(height: 14),
+              TextButton(
+                onPressed: _busy ? null : _onContinueOffline,
+                child: const Text('Continue without account'),
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -894,14 +1132,39 @@ class _AppShellState extends State<AppShell> {
 
 /* ===================== Today Screen ===================== */
 
+/// Bottom margin so floating snackbars clear the Today quick-add bar.
+const double _kQuickAddBarHeight = 56;
+const double _kQuickAddOuterPadding = 8;
+const double _kTodaySnackGap = 12;
+
+double todaySnackBarBottomMargin(BuildContext context) =>
+    _kQuickAddBarHeight + _kQuickAddOuterPadding + _kTodaySnackGap;
+
+SnackBar todaySnackBar(
+  BuildContext context, {
+  required Widget content,
+  Color? backgroundColor,
+  Duration duration = const Duration(seconds: 2),
+  SnackBarAction? action,
+}) {
+  return SnackBar(
+    content: content,
+    behavior: SnackBarBehavior.floating,
+    margin: EdgeInsets.fromLTRB(16, 0, 16, todaySnackBarBottomMargin(context)),
+    backgroundColor: backgroundColor,
+    duration: duration,
+    action: action,
+  );
+}
+
 class TodayScreen extends StatefulWidget {
   final VoidCallback onOpenHistory;
-  final VoidCallback onOpenSettings;
+  final void Function(bool) onDarkModeChanged;
 
   const TodayScreen({
     super.key,
     required this.onOpenHistory,
-    required this.onOpenSettings,
+    required this.onDarkModeChanged,
   });
 
   @override
@@ -913,6 +1176,7 @@ class _TodayScreenState extends State<TodayScreen> {
   final List<Task> _tasks = [];
   Focus _focus = Focus.work;
   String _searchQuery = '';
+  bool _searchExpanded = false;
   bool _showCommittedOnly = false;
   bool _showRolledOverOnly = false;
   bool _isLoadingTasks = true;
@@ -972,6 +1236,14 @@ class _TodayScreenState extends State<TodayScreen> {
 
     _loadActive();
     _scheduleDailyEndDayNotification();
+    SyncBus.instance.addListener(_onSyncBus);
+  }
+
+  void _onSyncBus() {
+    if (!mounted) return;
+    _mode = Storage.loadMode();
+    _rules = ModeRules(_mode);
+    _loadActive();
   }
   
   void _onPomodoroUpdate() {
@@ -980,6 +1252,7 @@ class _TodayScreenState extends State<TodayScreen> {
 
   @override
   void dispose() {
+    SyncBus.instance.removeListener(_onSyncBus);
     _pomo.removeListener(_onPomodoroUpdate);
     _pomo.dispose();
     super.dispose();
@@ -1012,7 +1285,7 @@ class _TodayScreenState extends State<TodayScreen> {
     await notifications.zonedSchedule(
       999,
       'End your day',
-      'How was your day? 🙂 😐 🙁',
+      'How was your day? Open Leanly to log your mood.',
       scheduled,
       details,
       androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
@@ -1061,7 +1334,8 @@ class _TodayScreenState extends State<TodayScreen> {
     const freeTaskLimit = 15;
     if (!premium.isPremium && _tasks.length >= freeTaskLimit) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+        todaySnackBar(
+          context,
           content: Row(
             children: [
               const Icon(Icons.lock_outline, color: Colors.white),
@@ -1072,7 +1346,6 @@ class _TodayScreenState extends State<TodayScreen> {
             ],
           ),
           backgroundColor: context.themeWarning,
-          behavior: SnackBarBehavior.floating,
           action: SnackBarAction(
             label: 'Upgrade',
             textColor: Colors.white,
@@ -1131,10 +1404,10 @@ class _TodayScreenState extends State<TodayScreen> {
     setState(() => _tasks.removeWhere((x) => x.id == t.id));
     _persist();
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
+      todaySnackBar(
+        context,
         content: Text('Deleted "${t.title}"'),
         duration: const Duration(seconds: 1),
-        behavior: SnackBarBehavior.floating,
         action: SnackBarAction(
           label: 'Undo',
           textColor: Colors.white,
@@ -1157,7 +1430,8 @@ class _TodayScreenState extends State<TodayScreen> {
     if (next && !_rules.canCommitMore(_tasks)) {
       HapticFeedback.heavyImpact();
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+        todaySnackBar(
+          context,
           content: Row(
             children: [
               Icon(Icons.warning_amber_rounded, color: context.themeWarning),
@@ -1166,7 +1440,6 @@ class _TodayScreenState extends State<TodayScreen> {
             ],
           ),
           backgroundColor: context.themeWarning.withOpacity(0.1),
-          behavior: SnackBarBehavior.floating,
         ),
       );
       return;
@@ -1188,10 +1461,10 @@ class _TodayScreenState extends State<TodayScreen> {
     });
     _persist();
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
+      todaySnackBar(
+        context,
         content: Text('Moved "${t.title}" to To do'),
         duration: const Duration(seconds: 1),
-        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -1200,7 +1473,8 @@ class _TodayScreenState extends State<TodayScreen> {
     if (!_rules.canMoveToDoing(_tasks)) {
       HapticFeedback.heavyImpact();
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+        todaySnackBar(
+          context,
           content: Row(
             children: [
               Icon(Icons.warning_amber_rounded, color: context.themeWarning),
@@ -1209,7 +1483,6 @@ class _TodayScreenState extends State<TodayScreen> {
             ],
           ),
           backgroundColor: context.themeWarning.withOpacity(0.1),
-          behavior: SnackBarBehavior.floating,
         ),
       );
       return;
@@ -1221,10 +1494,10 @@ class _TodayScreenState extends State<TodayScreen> {
     });
     _persist();
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
+      todaySnackBar(
+        context,
         content: Text('Started working on "${t.title}"'),
         duration: const Duration(seconds: 1),
-        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -1237,7 +1510,8 @@ class _TodayScreenState extends State<TodayScreen> {
     });
     _persist();
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
+      todaySnackBar(
+        context,
         content: Row(
           children: [
             Icon(Icons.check_circle, color: context.themeSuccess),
@@ -1253,8 +1527,6 @@ class _TodayScreenState extends State<TodayScreen> {
           ],
         ),
         backgroundColor: context.themeSuccess.withOpacity(0.1),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -1281,17 +1553,17 @@ class _TodayScreenState extends State<TodayScreen> {
                 spacing: 12,
                 children: [
                   _MoodChip(
-                    emoji: '🙂',
+                    icon: moodToIcon(DayMood.good),
                     label: 'Good',
                     onTap: () => Navigator.pop(ctx, DayMood.good),
                   ),
                   _MoodChip(
-                    emoji: '😐',
+                    icon: moodToIcon(DayMood.meh),
                     label: 'Meh',
                     onTap: () => Navigator.pop(ctx, DayMood.meh),
                   ),
                   _MoodChip(
-                    emoji: '🙁',
+                    icon: moodToIcon(DayMood.hard),
                     label: 'Hard',
                     onTap: () => Navigator.pop(ctx, DayMood.hard),
                   ),
@@ -1406,86 +1678,102 @@ widget.onOpenHistory();
     final doing = visible.where((t) => t.status == TaskStatus.doing).toList();
     final done = visible.where((t) => t.status == TaskStatus.done).toList();
 
+    final focusDoingCount = doing.length;
+    final focusDoneCount = done.length;
+    final focusTotalCount = visible.length;
+
     final wip = _rules.wipLimit;
-    final wipLabel = wip == null ? 'No WIP' : 'WIP $doingCount/$wip';
 
     final commitLimit = _rules.dailyCommitLimit;
-    final commitLabel = (commitLimit == null)
-        ? null
-        : 'Committed $committedDoneCount/$commitLimit';
+    final focusCommittedDone = visible
+        .where((t) => t.committedToday && t.status == TaskStatus.done)
+        .length;
+    final focusCommittedCount = visible.where((t) => t.committedToday).length;
 
-    // Pomodoro status
     final pomodoroStatus = _pomo.running
-        ? '🍅 ${_pomo.remainingText}'
+        ? 'Focus ${_pomo.remainingText}'
         : null;
 
     return Scaffold(
       backgroundColor: context.themeBg,
-      floatingActionButton: Semantics(
-        label: 'Add new task',
-        button: true,
-        child: TweenAnimationBuilder<double>(
-          tween: Tween(begin: 0.0, end: 1.0),
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-          builder: (context, value, child) {
-            return Transform.scale(
-              scale: value,
-              child: FloatingActionButton(
-        onPressed: _openAddSheet,
-                backgroundColor: context.themeAccent,
-        child: const Icon(Icons.add),
-              ),
-            );
-          },
-        ),
-      ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            children: [
-              _HeaderCard(
-                title: 'Today',
-                subtitle: [
-                  _rules.displayName,
-                  wipLabel,
-                  if (commitLabel != null) commitLabel,
-                  if (pomodoroStatus != null) pomodoroStatus,
-                ].join(' • '),
-                leftStatLabel: 'Doing',
-                leftStatValue: wip == null ? '$doingCount' : '$doingCount/$wip',
-                leftStatWipLimit: wip,
-                leftStatDoingCount: doingCount,
-                midStatLabel: 'Done',
-                midStatValue: '$doneCount',
-                rightStatLabel: 'Focus',
-                rightStatValue: titleCase(_focus.name),
-                onSettings: widget.onOpenSettings ?? () {},
-                onPomodoro: _openDeepFocus,
-                onEndDay: _endDay,
-              ),
-              const SizedBox(height: AppSpacing.md),
-              _FocusPills(
-                selected: _focus,
-                onSelect: (f) => setState(() => _focus = f),
-              ),
-              const SizedBox(height: AppSpacing.md),
-              _SearchAndFilterBar(
-                searchQuery: _searchQuery,
-                showCommittedOnly: _showCommittedOnly,
-                showRolledOverOnly: _showRolledOverOnly,
-                onSearchChanged: (query) => setState(() => _searchQuery = query),
-                onCommittedToggle: (value) => setState(() => _showCommittedOnly = value),
-                onRolledOverToggle: (value) => setState(() => _showRolledOverOnly = value),
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: _isLoadingTasks
-                    ? const _TodaySkeleton()
-                    : SingleChildScrollView(
-                  child: Column(
-                    children: [
+        child: Column(
+          children: [
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _ModeSegmentedControl(
+                      selected: _mode,
+                      onSelected: (m) async {
+                        setState(() {
+                          _mode = m;
+                          _rules = ModeRules(m);
+                        });
+                        await Storage.saveMode(m);
+                      },
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                    _HeaderCard(
+                      title: 'Today',
+                      mode: _mode,
+                      doingCount: focusDoingCount,
+                      wipLimit: wip,
+                      doneCount: focusDoneCount,
+                      committedDone: focusCommittedDone,
+                      commitLimit: commitLimit,
+                      committedCount: focusCommittedCount,
+                      focusLabel: titleCase(_focus.name),
+                      totalCount: focusTotalCount,
+                      pomodoroLabel: pomodoroStatus,
+                      onPomodoro: _openDeepFocus,
+                      onEndDay: _endDay,
+                      onToggleDarkMode: () {
+                        widget.onDarkModeChanged(!Storage.loadDarkMode());
+                      },
+                      onSearch: () => setState(() => _searchExpanded = true),
+                      searchActive: _searchExpanded ||
+                          _searchQuery.isNotEmpty ||
+                          _showCommittedOnly ||
+                          _showRolledOverOnly,
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                    _FocusPills(
+                      selected: _focus,
+                      onSelect: (f) => setState(() => _focus = f),
+                    ),
+                    if (_searchExpanded ||
+                        _searchQuery.isNotEmpty ||
+                        _showCommittedOnly ||
+                        _showRolledOverOnly) ...[
+                      const SizedBox(height: AppSpacing.sm),
+                      _SearchAndFilterBar(
+                        taskCount: _tasks.length,
+                        searchQuery: _searchQuery,
+                        showCommittedOnly: _showCommittedOnly,
+                        showRolledOverOnly: _showRolledOverOnly,
+                        onSearchChanged: (query) =>
+                            setState(() => _searchQuery = query),
+                        onCommittedToggle: (value) =>
+                            setState(() => _showCommittedOnly = value),
+                        onRolledOverToggle: (value) =>
+                            setState(() => _showRolledOverOnly = value),
+                        onCollapse: () {
+                          setState(() {
+                            _searchExpanded = false;
+                            _searchQuery = '';
+                            _showCommittedOnly = false;
+                            _showRolledOverOnly = false;
+                          });
+                        },
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    if (_isLoadingTasks)
+                      const _TodaySkeleton()
+                    else ...[
                       _SectionCard(
                         title: 'To do',
                         count: todo.length,
@@ -1532,11 +1820,15 @@ widget.onOpenHistory();
                       ),
                       const SizedBox(height: 24),
                     ],
-                  ),
+                  ],
                 ),
               ),
-            ],
-          ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+              child: _QuickAddBar(onTap: _openAddSheet),
+            ),
+          ],
         ),
       ),
     );
@@ -1608,7 +1900,18 @@ class _PomodoroScreenState extends State<PomodoroScreen> {
     return Scaffold(
       backgroundColor: context.themeBg,
       appBar: AppBar(
-        title: const Text('🍅 Deep Focus'),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.timer_rounded,
+              size: 22,
+              color: Theme.of(context).colorScheme.onSurface,
+            ),
+            const SizedBox(width: 8),
+            const Text('Deep Focus'),
+          ],
+        ),
         backgroundColor: Colors.transparent,
       ),
       body: SafeArea(
@@ -1698,7 +2001,7 @@ class _PomodoroScreenState extends State<PomodoroScreen> {
                       const SizedBox(height: 10),
                       Text(
                         'Deep Focus is optional.\n'
-                        'Move a task to Doing, then use 🍅 when you want to focus.\n'
+                        'Move a task to Doing, then tap the timer on Today when you want to focus.\n'
                         'Work sessions are logged; breaks are not tied to tasks.',
                         style: TextStyle(color: context.themeTextMuted),
                       ),
@@ -1781,6 +2084,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
   @override
   void initState() {
     super.initState();
+    SyncBus.instance.addListener(_onSyncBus);
     // Simulate async load so we can show skeletons on first frame
     Future.microtask(() {
     final allLogs = Storage.loadAllDayLogs();
@@ -1791,6 +2095,26 @@ class _HistoryScreenState extends State<HistoryScreen> {
         });
       }
     });
+  }
+
+  void _onSyncBus() {
+    if (!mounted) return;
+    setState(() => _logs = null);
+    Future.microtask(() {
+      final allLogs = Storage.loadAllDayLogs();
+      final logs = [...allLogs]..sort((a, b) => b.dayKey.compareTo(a.dayKey));
+      if (mounted) {
+        setState(() {
+          _logs = logs;
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    SyncBus.instance.removeListener(_onSyncBus);
+    super.dispose();
   }
 
   @override
@@ -1868,13 +2192,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
                       },
                     ),
                     const SizedBox(width: AppSpacing.sm),
-                    _HistoryFilterChip(
-                      label: 'XP',
-                      selected: _filter == FlowMode.xp,
-                      onSelected: () {
-                        setState(() => _filter = FlowMode.xp);
-                      },
-                    ),
                   ],
                 ),
               ),
@@ -1925,14 +2242,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
                               final commitBadge =
                                   (log.mode == FlowMode.scrum)
-                          ? ' • ✅ ${log.committedDoneCount}/${log.committedCount}'
+                          ? ' • Committed ${log.committedDoneCount}/${log.committedCount}'
                           : '';
 
                       return _HistoryCard(
                         dayKey: log.dayKey,
-                        emoji: moodToEmoji(log.mood),
+                        moodIcon: moodToIcon(log.mood),
                         subtitle:
-                            '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • 🍅 $pomos ($focusMinutes min)$commitBadge',
+                            '${ModeRules(log.mode).displayName} • Done ${log.doneCount} • Focus $pomos ($focusMinutes min)$commitBadge',
                         onTap: () {
                           Navigator.push(
                             context,
@@ -1999,7 +2316,7 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
     final focusMinutes = workSessions.fold<int>(0, (sum, s) => sum + s.minutes);
 
     final commitInfo = (log.mode == FlowMode.scrum)
-        ? ' • ✅ ${log.committedDoneCount}/${log.committedCount}'
+        ? ' • Committed ${log.committedDoneCount}/${log.committedCount}'
         : '';
 
     return Scaffold(
@@ -2014,9 +2331,9 @@ class _DayDetailScreenState extends State<DayDetailScreen> {
           child: Column(
             children: [
               _DaySummaryCard(
-                moodEmoji: moodToEmoji(log.mood),
+                moodIcon: moodToIcon(log.mood),
                 subtitle:
-                    '${ModeRules(log.mode).displayName} • Done ${done.length} • 🍅 $pomos ($focusMinutes min)$commitInfo',
+                    '${ModeRules(log.mode).displayName} • Done ${done.length} • Focus $pomos ($focusMinutes min)$commitInfo',
               ),
               const SizedBox(height: 12),
               _FocusPills(
@@ -2127,6 +2444,144 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const Text('Settings',
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
               const SizedBox(height: 12),
+              Consumer<SupabaseAuthController>(
+                builder: (context, auth, _) {
+                  if (!auth.isConfigured) {
+                    return _SectionCard(
+                      title: 'Sign in & account sync',
+                      count: 0,
+                      child: Text(
+                        'Supabase is not set up in this build. Run with '
+                        '--dart-define=SUPABASE_URL=... and '
+                        '--dart-define=SUPABASE_ANON_KEY=... then apply supabase/schema.sql in the dashboard.',
+                        style: TextStyle(
+                          color: context.themeTextMuted,
+                          fontSize: 13,
+                        ),
+                      ),
+                    );
+                  }
+                  return _SectionCard(
+                    title: 'Sign in & account sync',
+                    count: 0,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (auth.isSignedIn) ...[
+                          Text(
+                            auth.userLabel ?? 'Signed in',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                              height: 1.3,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ] else ...[
+                          Text(
+                            'Sign in with Apple to sync tasks, day history, Pomodoro logs, and settings across devices.',
+                            style: TextStyle(
+                              color: context.themeTextMuted,
+                              fontSize: 13,
+                              height: 1.45,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+                        if (!auth.isSignedIn) ...[
+                          FilledButton.icon(
+                            onPressed: () async {
+                              final err = await auth.signInWithApple();
+                              if (!context.mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    err ?? 'Signed in and synced.',
+                                  ),
+                                  behavior: SnackBarBehavior.floating,
+                                ),
+                              );
+                            },
+                            icon: const Icon(Icons.apple),
+                            label: const Text('Sign in with Apple'),
+                          ),
+                          if (Storage.loadSkipCloudLogin()) ...[
+                            const SizedBox(height: 8),
+                            TextButton(
+                              onPressed: () async {
+                                await Storage.saveSkipCloudLogin(false);
+                                CloudLoginGateNotifier.instance.refresh();
+                              },
+                              child: const Text('Show full-screen sign-in'),
+                            ),
+                          ],
+                        ] else ...[
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: () async {
+                                    final err = await auth.syncNowPull();
+                                    if (!context.mounted) return;
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                          err ?? 'Downloaded from cloud.',
+                                        ),
+                                        behavior: SnackBarBehavior.floating,
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    Icons.cloud_download_outlined,
+                                  ),
+                                  label: const Text('Pull'),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: () async {
+                                    final err = await auth.syncNowPush();
+                                    if (!context.mounted) return;
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                          err ?? 'Uploaded to cloud.',
+                                        ),
+                                        behavior: SnackBarBehavior.floating,
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    Icons.cloud_upload_outlined,
+                                  ),
+                                  label: const Text('Push'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          TextButton(
+                            onPressed: () async {
+                              final err = await auth.signOut();
+                              if (!context.mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(err ?? 'Signed out.'),
+                                  behavior: SnackBarBehavior.floating,
+                                ),
+                              );
+                            },
+                            child: const Text('Sign out'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(height: 12),
               _SectionCard(
                 title: 'Appearance',
                 count: 0,
@@ -2219,12 +2674,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       }).toList(),
                     ),
                     const SizedBox(height: 12),
-                    Text(detail,
-                        style: TextStyle(color: context.themeTextMuted)),
-                    const SizedBox(height: 8),
                     Text(
-                      'Kanban/XP: WIP blocks moving into Doing.\nScrum: daily commitment caps your plan (3 tasks).',
-                      style: TextStyle(color: context.themeTextMuted),
+                      detail,
+                      style: TextStyle(
+                        color: context.themeTextMuted,
+                        fontSize: 13,
+                        height: 1.35,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'Kanban: WIP limits tasks in Doing.\n'
+                      'Scrum: commit up to 3 tasks per day.',
+                      style: TextStyle(
+                        color: context.themeTextMuted,
+                        fontSize: 12,
+                        height: 1.5,
+                      ),
                     ),
                   ],
                 ),
@@ -2327,7 +2794,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ),
                         Text(
-                          'v1.0.0',
+                          'v1.2.3',
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w500,
@@ -2337,7 +2804,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Personal task planner inspired by agile workflows (Scrum, Kanban, XP).',
+                      'Personal task planner inspired by agile workflows (Scrum, Kanban).',
                       style: TextStyle(
                         fontSize: 13,
                         color: context.themeTextMuted,
@@ -2353,7 +2820,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Text(
-                            'All data is stored locally on this device. No accounts, no cloud sync.',
+                            'Tasks stay on this device by default. If you use Cloud sync (Sign in with Apple), data is stored in your Supabase project under your account.',
                             style: TextStyle(
                               fontSize: 13,
                               color: context.themeTextMuted,
@@ -2631,12 +3098,12 @@ class _FeatureItem extends StatelessWidget {
 /* ===================== UI Widgets ===================== */
 
 class _MoodChip extends StatelessWidget {
-  final String emoji;
+  final IconData icon;
   final String label;
   final VoidCallback onTap;
 
   const _MoodChip({
-    required this.emoji,
+    required this.icon,
     required this.label,
     required this.onTap,
   });
@@ -2644,117 +3111,428 @@ class _MoodChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ActionChip(
-      label: Text('$emoji  $label'),
+      avatar: Icon(icon, size: 22, color: context.themeTextMuted),
+      label: Text(label),
       onPressed: onTap,
+    );
+  }
+}
+
+class _ModeSegmentedControl extends StatelessWidget {
+  final FlowMode selected;
+  final ValueChanged<FlowMode> onSelected;
+
+  const _ModeSegmentedControl({
+    required this.selected,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = context.themeAccent;
+    final onSurface = Theme.of(context).colorScheme.onSurface;
+
+    return SegmentedButton<FlowMode>(
+      segments: const [
+        ButtonSegment(
+          value: FlowMode.scrum,
+          label: Text('Scrum'),
+          icon: Icon(Icons.view_timeline_rounded, size: 18),
+        ),
+        ButtonSegment(
+          value: FlowMode.kanban,
+          label: Text('Kanban'),
+          icon: Icon(Icons.view_kanban_rounded, size: 18),
+        ),
+      ],
+      selected: {selected},
+      onSelectionChanged: (modes) => onSelected(modes.first),
+      style: ButtonStyle(
+        visualDensity: VisualDensity.compact,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        foregroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) {
+            return Colors.white;
+          }
+          return onSurface.withValues(alpha: 0.75);
+        }),
+        backgroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) {
+            return accent;
+          }
+          return context.themeCard;
+        }),
+        side: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) {
+            return BorderSide(color: accent);
+          }
+          return BorderSide(
+            color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.2),
+          );
+        }),
+      ),
+    );
+  }
+}
+
+class _ModeStatusPanel extends StatelessWidget {
+  final FlowMode mode;
+  final int doingCount;
+  final int? wipLimit;
+  final int doneCount;
+  final int totalCount;
+  final int committedDone;
+  final int? commitLimit;
+  final int committedCount;
+  final String? pomodoroLabel;
+
+  const _ModeStatusPanel({
+    required this.mode,
+    required this.doingCount,
+    required this.wipLimit,
+    required this.doneCount,
+    required this.totalCount,
+    required this.committedDone,
+    required this.commitLimit,
+    required this.committedCount,
+    this.pomodoroLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (pomodoroLabel != null) ...[
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: context.themeAccent.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.timer_outlined, size: 16, color: context.themeAccent),
+                const SizedBox(width: 6),
+                Text(
+                  pomodoroLabel!,
+                  style: TextStyle(
+                    fontSize: AppTypography.sm,
+                    fontWeight: FontWeight.w600,
+                    color: context.themeAccent,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+        ],
+        if (wipLimit != null) ...[
+          _StatusMeter(
+            fraction: '$doingCount/$wipLimit',
+            progress: doingCount / wipLimit!,
+            accent: doingCount >= wipLimit!
+                ? context.themeError
+                : doingCount / wipLimit! >= 0.8
+                    ? context.themeWarning
+                    : context.themeAccent,
+          ),
+          const SizedBox(height: AppSpacing.sm),
+        ] else if (commitLimit != null && totalCount > 0) ...[
+          _StatusMeter(
+            fraction: '$doneCount/$totalCount',
+            progress: doneCount / totalCount,
+            accent: context.themeAccent,
+          ),
+          const SizedBox(height: AppSpacing.sm),
+        ],
+      ],
+    );
+  }
+}
+
+class _StatusMeter extends StatelessWidget {
+  final String fraction;
+  final double progress;
+  final Color accent;
+
+  const _StatusMeter({
+    required this.fraction,
+    required this.progress,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final clamped = progress.clamp(0.0, 1.0);
+
+    return Row(
+      children: [
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: clamped,
+              minHeight: 8,
+              backgroundColor: context.themeSoftRow,
+              color: accent,
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text(
+          fraction,
+          style: TextStyle(
+            fontSize: AppTypography.sm,
+            fontWeight: FontWeight.w800,
+            color: accent,
+            letterSpacing: 0.2,
+          ),
+        ),
+      ],
     );
   }
 }
 
 class _HeaderCard extends StatelessWidget {
   final String title;
-  final String subtitle;
-
-  final String leftStatLabel;
-  final String leftStatValue;
-  final int? leftStatWipLimit;
-  final int? leftStatDoingCount;
-
-  final String midStatLabel;
-  final String midStatValue;
-
-  final String rightStatLabel;
-  final String rightStatValue;
+  final FlowMode mode;
+  final int doingCount;
+  final int? wipLimit;
+  final int doneCount;
+  final int totalCount;
+  final int committedDone;
+  final int? commitLimit;
+  final int committedCount;
+  final String focusLabel;
+  final String? pomodoroLabel;
 
   final VoidCallback onEndDay;
-  final VoidCallback onSettings;
   final VoidCallback onPomodoro;
+  final VoidCallback onToggleDarkMode;
+  final VoidCallback onSearch;
+  final bool searchActive;
 
   const _HeaderCard({
     required this.title,
-    required this.subtitle,
-    required this.leftStatLabel,
-    required this.leftStatValue,
-    this.leftStatWipLimit,
-    this.leftStatDoingCount,
-    required this.midStatLabel,
-    required this.midStatValue,
-    required this.rightStatLabel,
-    required this.rightStatValue,
+    required this.mode,
+    required this.doingCount,
+    required this.wipLimit,
+    required this.doneCount,
+    required this.totalCount,
+    required this.committedDone,
+    required this.commitLimit,
+    required this.committedCount,
+    required this.focusLabel,
+    this.pomodoroLabel,
     required this.onEndDay,
-    required this.onSettings,
     required this.onPomodoro,
+    required this.onToggleDarkMode,
+    required this.onSearch,
+    this.searchActive = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: context.themeCard,
+        borderRadius: BorderRadius.circular(AppRadius.card),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: AppTypography.xl,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              TopIconButton(
+                icon: Icons.search_rounded,
+                tooltip: 'Search tasks',
+                onTap: onSearch,
+                highlighted: searchActive,
+              ),
+              TopIconButton(
+                icon: Icons.timer_rounded,
+                tooltip: 'Deep Focus',
+                onTap: onPomodoro,
+              ),
+              TopIconButton(
+                icon: Icons.flag_rounded,
+                tooltip: 'End day',
+                onTap: onEndDay,
+              ),
+              TopIconButton(
+                icon: isDark
+                    ? Icons.light_mode_rounded
+                    : Icons.dark_mode_rounded,
+                tooltip: isDark ? 'Light mode' : 'Dark mode',
+                onTap: onToggleDarkMode,
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          _ModeStatusPanel(
+            mode: mode,
+            doingCount: doingCount,
+            wipLimit: wipLimit,
+            doneCount: doneCount,
+            totalCount: totalCount,
+            committedDone: committedDone,
+            commitLimit: commitLimit,
+            committedCount: committedCount,
+            pomodoroLabel: pomodoroLabel,
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          Row(
+            children: [
+              Expanded(
+                child: _CompactStat(
+                  icon: Icons.play_circle_rounded,
+                  label: 'Doing',
+                  value: wipLimit == null
+                      ? '$doingCount'
+                      : '$doingCount/$wipLimit',
+                  accent: context.themeInfo,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _CompactStat(
+                  icon: Icons.check_circle_rounded,
+                  label: 'Done',
+                  value: '$doneCount',
+                  accent: context.themeSuccess,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _CompactStat(
+                  icon: Icons.label_rounded,
+                  label: 'Focus',
+                  value: focusLabel,
+                  accent: context.themeAccent,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CompactStat extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+  final Color accent;
+
+  const _CompactStat({
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.accent,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(AppSpacing.lg),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
       decoration: BoxDecoration(
-        color: context.themeCard,
-        borderRadius: BorderRadius.circular(18),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.03),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
-          ),
-        ],
+        color: context.themeSoftRow,
+        borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Icon(icon, size: 16, color: accent),
+          const SizedBox(width: 6),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title,
-                    style: const TextStyle(
-                        fontSize: AppTypography.xl, fontWeight: FontWeight.w700)),
-                const SizedBox(height: AppSpacing.xs),
-                Text(subtitle,
-                    style: TextStyle(
-                        fontSize: AppTypography.sm, color: context.themeTextMuted)),
-                const SizedBox(height: AppSpacing.md),
-                Row(
-                  children: [
-                    _MiniStat(
-                      label: leftStatLabel,
-                      value: leftStatValue,
-                      wipLimit: leftStatWipLimit,
-                      doingCount: leftStatDoingCount,
-                    ),
-                    const SizedBox(width: 12),
-                    _MiniStat(label: midStatLabel, value: midStatValue),
-                    const SizedBox(width: 12),
-                    _MiniStat(label: rightStatLabel, value: rightStatValue),
-                  ],
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: context.themeTextMuted,
+                  ),
+                ),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: AppTypography.md,
+                    fontWeight: FontWeight.w800,
+                    height: 1.1,
+                    color: Theme.of(context).colorScheme.onSurface,
+                  ),
                 ),
               ],
             ),
           ),
-          Column(
-            children: [
-  TopIconButton(
-    icon: Icons.settings_rounded,
-    tooltip: 'Settings',
-    onTap: onSettings,
-  ),
-  const SizedBox(height: 6),
-  TopIconButton(
-    icon: Icons.timer_rounded,
-    tooltip: 'Deep Focus',
-    onTap: onPomodoro,
-  ),
-  const SizedBox(height: 6),
-  TopIconButton(
-    icon: Icons.nightlight_round,
-    tooltip: 'End Day',
-    onTap: onEndDay,
-  ),
-],
-
-          ),
         ],
+      ),
+    );
+  }
+}
+
+class _QuickAddBar extends StatelessWidget {
+  final VoidCallback onTap;
+
+  const _QuickAddBar({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: context.themeCard,
+      borderRadius: BorderRadius.circular(AppRadius.card),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppRadius.card),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(AppRadius.card),
+            border: Border.all(
+              color: context.themeAccent.withValues(alpha: 0.35),
+            ),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Add a new task...',
+                  style: TextStyle(
+                    fontSize: AppTypography.md,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withValues(alpha: 0.55),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              Icon(Icons.add_circle_rounded, color: context.themeAccent, size: 28),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -2871,6 +3649,9 @@ class _FocusPills extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final onSurface = Theme.of(context).colorScheme.onSurface;
+    final outline = Theme.of(context).colorScheme.outline;
+
     return SizedBox(
       height: 44,
       child: ListView(
@@ -2886,10 +3667,16 @@ class _FocusPills extends StatelessWidget {
               onSelected: (_) => onSelect(f),
               labelStyle: TextStyle(
                 fontWeight: FontWeight.w600,
-                color: isOn ? Colors.white : const Color(0xFF111827),
+                color: isOn ? Colors.white : onSurface,
               ),
               selectedColor: context.themeAccent,
-backgroundColor: context.themeCard,
+              backgroundColor: context.themeCard,
+              side: BorderSide(
+                color: isOn
+                    ? context.themeAccent
+                    : outline.withValues(alpha: 0.45),
+                width: isOn ? 1.5 : 1,
+              ),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(14),
               ),
@@ -2916,26 +3703,29 @@ class _SectionCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
+      clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(AppRadius.card),
       ),
       color: context.themeCard,
-      shadowColor: Colors.black.withOpacity(0.05),
-  child: Padding(
-    padding: const EdgeInsets.all(AppSpacing.lg),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.lg),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
               title,
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                height: 1.2,
+              ),
             ),
-            const SizedBox(width: 8),
-            if (count > 0)
+            if (count > 0) ...[
+              const SizedBox(height: 8),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 decoration: BoxDecoration(
                   color: context.themeSoftRow,
                   borderRadius: BorderRadius.circular(999),
@@ -2945,15 +3735,13 @@ class _SectionCard extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
               ),
+            ],
+            const SizedBox(height: 12),
+            child,
           ],
         ),
-        const SizedBox(height: 10),
-        child,
-      ],
-    ),
-  ),
-);
-
+      ),
+    );
   }
 }
 
@@ -2982,10 +3770,25 @@ class _EmptyTaskState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            icon,
-            size: 48,
-            color: context.themeTextMuted.withOpacity(0.5),
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  context.themeAccent.withValues(alpha: 0.18),
+                  context.themeSoftRow,
+                ],
+              ),
+            ),
+            child: Icon(
+              icon,
+              size: 36,
+              color: context.themeAccent.withValues(alpha: 0.85),
+            ),
           ),
           const SizedBox(height: AppSpacing.md),
           Text(
@@ -2993,7 +3796,7 @@ class _EmptyTaskState extends StatelessWidget {
             style: TextStyle(
               fontSize: AppTypography.md,
               color: context.themeTextMuted,
-              fontWeight: FontWeight.w500,
+              fontWeight: FontWeight.w600,
             ),
             textAlign: TextAlign.center,
           ),
@@ -3195,7 +3998,7 @@ Widget build(BuildContext context) {
   if (tasks.isEmpty) {
       return _EmptyTaskState(
         message: 'No tasks yet',
-        icon: Icons.task_alt_outlined,
+        icon: Icons.playlist_add_check_rounded,
     );
   }
 
@@ -3219,22 +4022,24 @@ Widget build(BuildContext context) {
           // swipe right (move forward)
           background: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFFDCFCE7),
+              color: context.themeSuccess.withValues(alpha: 0.22),
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFFE5E7EB)),
+              border: Border.all(
+                color: context.themeSuccess.withValues(alpha: 0.4),
+              ),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 16),
             alignment: Alignment.centerLeft,
-            child: const Row(
+            child: Row(
               children: [
-                Icon(
-                  Icons.arrow_forward,
-                  color: Colors.black87,
-                ),
-                SizedBox(width: 8),
+                Icon(Icons.arrow_forward, color: context.themeSuccess),
+                const SizedBox(width: 8),
                 Text(
                   'Move forward',
-                  style: TextStyle(color: Colors.black87),
+                  style: TextStyle(
+                    color: context.themeSuccess,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ],
             ),
@@ -3243,24 +4048,26 @@ Widget build(BuildContext context) {
           // swipe left (move back)
           secondaryBackground: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFFDBEAFE),
+              color: context.themeInfo.withValues(alpha: 0.22),
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFFE5E7EB)),
+              border: Border.all(
+                color: context.themeInfo.withValues(alpha: 0.4),
+              ),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 16),
             alignment: Alignment.centerRight,
-            child: const Row(
+            child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
                 Text(
                   'Move back',
-                  style: TextStyle(color: Colors.black87),
+                  style: TextStyle(
+                    color: context.themeInfo,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-                SizedBox(width: 8),
-                Icon(
-                  Icons.arrow_back,
-                  color: Colors.black87,
-                ),
+                const SizedBox(width: 8),
+                Icon(Icons.arrow_back, color: context.themeInfo),
               ],
             ),
           ),
@@ -3287,7 +4094,10 @@ Widget build(BuildContext context) {
                           : context.themeSoftRow,
               borderRadius: BorderRadius.circular(14),
                       border: Border.all(
-                        color: const Color(0xFFE5E7EB),
+                        color: Theme.of(context)
+                            .colorScheme
+                            .outline
+                            .withValues(alpha: 0.15),
                         width: 1,
                       ),
             ),
@@ -3459,13 +4269,13 @@ child: ListTile(
 
 class _HistoryCard extends StatelessWidget {
   final String dayKey;
-  final String emoji;
+  final IconData moodIcon;
   final String subtitle;
   final VoidCallback onTap;
 
   const _HistoryCard({
     required this.dayKey,
-    required this.emoji,
+    required this.moodIcon,
     required this.subtitle,
     required this.onTap,
   });
@@ -3483,7 +4293,7 @@ class _HistoryCard extends StatelessWidget {
         ),
         child: Row(
           children: [
-            Text(emoji, style: const TextStyle(fontSize: 22)),
+            Icon(moodIcon, size: 28, color: context.themeTextMuted),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -3524,11 +4334,11 @@ class _HistoryCard extends StatelessWidget {
 }
 
 class _DaySummaryCard extends StatelessWidget {
-  final String moodEmoji;
+  final IconData moodIcon;
   final String subtitle;
 
   const _DaySummaryCard({
-    required this.moodEmoji,
+    required this.moodIcon,
     required this.subtitle,
   });
 
@@ -3542,7 +4352,7 @@ padding: const EdgeInsets.all(14),
       ),
       child: Row(
         children: [
-Text(moodEmoji, style: const TextStyle(fontSize: 28)),
+Icon(moodIcon, size: 36, color: context.themeAccent),
           const SizedBox(width: 12),
           Expanded(
   child: Text(
@@ -3572,6 +4382,11 @@ class AppSpacing {
   static const double lg = 16.0;
   static const double xl = 24.0;
   static const double xxl = 32.0;
+}
+
+class AppRadius {
+  static const double card = 20.0;
+  static const double control = 12.0;
 }
 
 // Typography scale
@@ -3619,12 +4434,12 @@ class AppThemes {
     textMuted: Color(0xFF64748B),
   );
   static const ThemePalette calmDark = ThemePalette(
-    accent: Color(0xFF8B8CF6),
-    bg: Color(0xFF0F172A),
-    card: Color(0xFF1E293B),
-    softRow: Color(0xFF334155),
-    softRowDim: Color(0xFF475569),
-    textMuted: Color(0xFF94A3B8),
+    accent: Color(0xFF9B9DFF),
+    bg: Color(0xFF0B1120),
+    card: Color(0xFF1A2438),
+    softRow: Color(0xFF243049),
+    softRowDim: Color(0xFF2F3D56),
+    textMuted: Color(0xFFB8C5D9),
   );
 
   // Ocean - Blue/Teal
@@ -3773,6 +4588,28 @@ ThemeData buildTheme(AppTheme theme, bool isDark) {
       brightness: isDark ? Brightness.dark : Brightness.light,
     ),
     scaffoldBackgroundColor: palette.bg,
+    navigationBarTheme: NavigationBarThemeData(
+      height: 72,
+      labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+      iconTheme: WidgetStateProperty.resolveWith((states) {
+        if (states.contains(WidgetState.selected)) {
+          return IconThemeData(color: palette.accent, size: 26);
+        }
+        return IconThemeData(color: palette.textMuted, size: 24);
+      }),
+      labelTextStyle: WidgetStateProperty.resolveWith((states) {
+        final base = TextStyle(
+          fontSize: 12,
+          fontWeight:
+              states.contains(WidgetState.selected) ? FontWeight.w700 : FontWeight.w500,
+        );
+        return base.copyWith(
+          color: states.contains(WidgetState.selected)
+              ? palette.accent
+              : palette.textMuted,
+        );
+      }),
+    ),
   );
 }
 
@@ -3784,31 +4621,34 @@ class TopIconButton extends StatelessWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onTap;
+  final bool highlighted;
 
   const TopIconButton({
     super.key,
     required this.icon,
     required this.tooltip,
     required this.onTap,
+    this.highlighted = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: onTap,
-        child: Tooltip(
-          message: tooltip,
-          child: Container(
-        padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: context.themeSoftRow,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(icon, size: 20),
-          ),
+    final accent = context.themeAccent;
+
+    return IconButton(
+      onPressed: onTap,
+      tooltip: tooltip,
+      visualDensity: VisualDensity.compact,
+      icon: Icon(icon, size: 22),
+      color: highlighted ? accent : Theme.of(context).colorScheme.onSurface,
+      style: IconButton.styleFrom(
+        padding: const EdgeInsets.all(8),
+        minimumSize: const Size(40, 40),
+        backgroundColor: highlighted
+            ? accent.withValues(alpha: 0.15)
+            : context.themeSoftRow,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.control),
         ),
       ),
     );
@@ -3893,8 +4733,9 @@ class _AddTaskSheetState extends State<_AddTaskSheet> {
                 child: TextField(
                   controller: _controller,
                   autofocus: true,
-                  decoration:
-                      const InputDecoration(hintText: 'What will you do today?'),
+                  decoration: const InputDecoration(
+                    hintText: 'Add a new task...',
+                  ),
                   onSubmitted: (v) {
                     widget.onAdd(v);
                   },
@@ -4022,22 +4863,53 @@ class _EditTaskSheetState extends State<_EditTaskSheet> {
 
 // ===================== Search and Filter Bar =====================
 
-class _SearchAndFilterBar extends StatelessWidget {
+class _SearchAndFilterBar extends StatefulWidget {
+  final int taskCount;
   final String searchQuery;
   final bool showCommittedOnly;
   final bool showRolledOverOnly;
   final ValueChanged<String> onSearchChanged;
   final ValueChanged<bool> onCommittedToggle;
   final ValueChanged<bool> onRolledOverToggle;
+  final VoidCallback onCollapse;
 
   const _SearchAndFilterBar({
+    required this.taskCount,
     required this.searchQuery,
     required this.showCommittedOnly,
     required this.showRolledOverOnly,
     required this.onSearchChanged,
     required this.onCommittedToggle,
     required this.onRolledOverToggle,
+    required this.onCollapse,
   });
+
+  @override
+  State<_SearchAndFilterBar> createState() => _SearchAndFilterBarState();
+}
+
+class _SearchAndFilterBarState extends State<_SearchAndFilterBar> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.searchQuery);
+  }
+
+  @override
+  void didUpdateWidget(covariant _SearchAndFilterBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.searchQuery != _controller.text) {
+      _controller.text = widget.searchQuery;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4045,48 +4917,61 @@ class _SearchAndFilterBar extends StatelessWidget {
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: context.themeCard,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(AppRadius.card),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+        ),
       ),
       child: Column(
         children: [
           TextField(
-            onChanged: onSearchChanged,
+            controller: _controller,
+            autofocus: widget.searchQuery.isEmpty,
+            onChanged: widget.onSearchChanged,
             decoration: InputDecoration(
               hintText: 'Search tasks...',
-              prefixIcon: const Icon(Icons.search),
-              suffixIcon: searchQuery.isNotEmpty
-                  ? IconButton(
-                      icon: const Icon(Icons.clear),
-                      onPressed: () => onSearchChanged(''),
-                    )
-                  : null,
+              prefixIcon: const Icon(Icons.search_rounded),
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (widget.searchQuery.isNotEmpty)
+                    IconButton(
+                      icon: const Icon(Icons.clear_rounded),
+                      tooltip: 'Clear search',
+                      onPressed: () => widget.onSearchChanged(''),
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded),
+                    tooltip: 'Close search',
+                    onPressed: widget.onCollapse,
+                  ),
+                ],
+              ),
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(AppRadius.control),
                 borderSide: BorderSide.none,
               ),
               filled: true,
               fillColor: context.themeSoftRow,
             ),
           ),
-          if (searchQuery.isNotEmpty || showCommittedOnly || showRolledOverOnly)
+          if (widget.taskCount >= 3)
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Wrap(
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  if (showCommittedOnly || showRolledOverOnly)
-                    FilterChip(
-                      label: const Text('Committed'),
-                      selected: showCommittedOnly,
-                      onSelected: onCommittedToggle,
-                    ),
-                  if (showCommittedOnly || showRolledOverOnly)
-                    FilterChip(
-                      label: const Text('Rolled Over'),
-                      selected: showRolledOverOnly,
-                      onSelected: onRolledOverToggle,
-                    ),
+                  FilterChip(
+                    label: const Text('Committed'),
+                    selected: widget.showCommittedOnly,
+                    onSelected: widget.onCommittedToggle,
+                  ),
+                  FilterChip(
+                    label: const Text('Rolled over'),
+                    selected: widget.showRolledOverOnly,
+                    onSelected: widget.onRolledOverToggle,
+                  ),
                 ],
               ),
             ),
@@ -4160,9 +5045,10 @@ class DaySummaryScreen extends StatelessWidget {
                 ),
                 child: Column(
                   children: [
-                    Text(
-                      moodToEmoji(mood),
-                      style: const TextStyle(fontSize: 64),
+                    Icon(
+                      moodToIcon(mood),
+                      size: 64,
+                      color: context.themeAccent,
                     ),
                     const SizedBox(height: 12),
                     Text(
@@ -4464,7 +5350,7 @@ class _StatsCard extends StatelessWidget {
                 child: _StatItem(
                   icon: Icons.mood,
                   label: 'Mood',
-                  value: moodToEmoji(mostCommonMood),
+                  value: moodToLabel(mostCommonMood),
                 ),
               ),
             ],
@@ -4530,7 +5416,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     _OnboardingPage(
       icon: Icons.today,
       title: 'Welcome to Leanly',
-      description: 'Your agile task management companion. Organize your day with Scrum, Kanban, or XP methodologies.',
+      description: 'Your agile task management companion. Organize your day with Scrum or Kanban.',
     ),
     _OnboardingPage(
       icon: Icons.swipe,
@@ -4540,7 +5426,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     _OnboardingPage(
       icon: Icons.timer,
       title: 'Deep Focus Mode',
-      description: 'Use the 🍅 button to start Pomodoro sessions. Track your focused work time throughout the day.',
+      description:
+          'Use the timer button on Today to start Pomodoro sessions. Track your focused work time throughout the day.',
     ),
     _OnboardingPage(
       icon: Icons.nightlight_round,
